@@ -42,6 +42,19 @@ services:
         condition: service_healthy
     networks: [signoz-network]
 
+  watcher-service:
+    build: ./watcher-service
+    environment:
+      OTEL_SERVICE_NAME: watcher-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://signoz-ingester:4318/v1/traces
+      CONTROL_PLANE_URL: http://control-plane:4001
+      SIGNOZ_URL: http://signoz:8080
+      PORT: 4002
+    ports:
+      - "4002:4002"
+    depends_on: [control-plane]
+    networks: [signoz-network]
+
 # The network SigNoz already created via foundryctl cast. `external: true` means
 # compose joins it rather than trying to create/own it.
 networks:
