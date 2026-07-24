@@ -1,0 +1,52 @@
+# docker-compose.yml — your app services (NOT SigNoz's stack).
+# SigNoz runs separately via `foundryctl cast` (see casting.yaml) and owns the
+# external `signoz-network`. These services join that network so they can reach
+# the OTel collector by its network alias `signoz-ingester`.
+#
+# IMPORTANT: the collector is reachable as `signoz-ingester` on this network,
+# NOT `signoz-otel-collector`. Using the wrong host makes telemetry silently
+# vanish (no error, no traces in SigNoz).
+
+services:
+  app-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: hackathon
+      POSTGRES_USER: hackathon
+      POSTGRES_PASSWORD: hackathon
+    ports:
+      - "5433:5432" # host 5433 (5432 avoided) for manual inspection; internal stays 5432
+    volumes:
+      - app-postgres-data:/var/lib/postgresql/data
+      # Postgres runs any *.sql here automatically on FIRST init — this is how
+      # the schema in 001_init.sql gets created with zero manual steps.
+      - ./control-plane/migrations:/docker-entrypoint-initdb.d:ro
+    networks: [signoz-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hackathon -d hackathon"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  control-plane:
+    build: ./control-plane
+    environment:
+      OTEL_SERVICE_NAME: control-plane
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://signoz-ingester:4318/v1/traces
+      DATABASE_URL: postgres://hackathon:hackathon@app-postgres:5432/hackathon
+      PORT: 4001
+    ports:
+      - "4001:4001"
+    depends_on:
+      app-postgres:
+        condition: service_healthy
+    networks: [signoz-network]
+
+# The network SigNoz already created via foundryctl cast. `external: true` means
+# compose joins it rather than trying to create/own it.
+networks:
+  signoz-network:
+    external: true
+
+volumes:
+  app-postgres-data:
