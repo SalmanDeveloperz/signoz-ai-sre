@@ -1,0 +1,11 @@
+# Foundry-generated deployment files — regenerable from casting.yaml + casting.yaml.lock
+# via `foundryctl cast`, so we don't commit them. The two casting.* files ARE committed.
+pours/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Env files (never commit real secrets/config)
+.env
+*.local.env
