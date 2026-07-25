@@ -1,4 +1,4 @@
-# docker-compose.yml — your app services (NOT SigNoz's stack).
+# docker-compose.yml: your app services (NOT SigNoz's stack).
 # SigNoz runs separately via `foundryctl cast` (see casting.yaml) and owns the
 # external `signoz-network`. These services join that network so they can reach
 # the OTel collector by its network alias `signoz-ingester`.
@@ -18,7 +18,7 @@ services:
       - "5433:5432" # host 5433 (5432 avoided) for manual inspection; internal stays 5432
     volumes:
       - app-postgres-data:/var/lib/postgresql/data
-      # Postgres runs any *.sql here automatically on FIRST init — this is how
+      # Postgres runs any *.sql here automatically on FIRST init, this is how
       # the schema in 001_init.sql gets created with zero manual steps.
       - ./control-plane/migrations:/docker-entrypoint-initdb.d:ro
     networks: [signoz-network]
@@ -48,7 +48,15 @@ services:
       OTEL_SERVICE_NAME: watcher-service
       OTEL_EXPORTER_OTLP_ENDPOINT: http://signoz-ingester:4318/v1/traces
       CONTROL_PLANE_URL: http://control-plane:4001
-      SIGNOZ_URL: http://signoz:8080
+      # signoz-signoz-0 is the real container alias on signoz-network, found
+      # by inspecting the network directly, "signoz" (the old value here)
+      # does not resolve and Tier 2's queries would silently return nothing.
+      SIGNOZ_URL: http://signoz-signoz-0:8080
+      # Both read from a root .env file (gitignored). Blank/unset = Tier 2
+      # (AI investigation of unrecognized alerts) safely no-ops.
+      SIGNOZ_API_KEY: ${SIGNOZ_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
       PORT: 4002
     ports:
       - "4002:4002"
