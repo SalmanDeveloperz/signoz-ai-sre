@@ -39,11 +39,11 @@ Software breaks in ways that fall into two buckets. **Known patterns**: you've s
 | A permanent audit log of every automated action taken | Done, verified live, every test alert wrote a real row | `control-plane` |
 | 2 real SigNoz alert rules, firing automatically on real telemetry | Done, both confirmed firing without any manual trigger of the webhook itself | SigNoz UI |
 | Tier 1: deterministic diagnosis + safety check + fix + report for the 2 known failures | Done, verified live with real SigNoz-fired alerts | `watcher-service/src/services/{diagnose,safetyCheck,remediation.service}.js` |
-| Tier 2: an LLM agent that investigates *unrecognized* alerts using real SigNoz telemetry as tools | **Built and verified up to the LLM call itself.** The SigNoz query tools, the tool-calling loop, the guardrails, the OTel spans, all tested with real data. Needs an `ANTHROPIC_API_KEY` to actually invoke the model, see [Section 6](#6-the-ai--agent-layer-in-full). | `watcher-service/src/services/investigate.js`, `src/clients/{llmClient,signozClient}.js` |
+| Tier 2: an LLM agent that investigates *unrecognized* alerts using real SigNoz telemetry as tools | **Built and verified up to the LLM call itself.** The SigNoz query tools, the tool-calling loop, the guardrails, the OTel spans, all tested with real data. Provider-agnostic via the Vercel AI SDK, defaults to Gemini, works the same with Anthropic or OpenAI. Needs a real API key for whichever provider is active, see [Section 6](#6-the-ai--agent-layer-in-full). | `watcher-service/src/services/investigate.js`, `src/clients/{llmClient,signozClient}.js` |
 | A UI for demoing, instead of raw curl/terminal | **Not done** | see [Section 9](#9-the-ui-reactnextjs) |
 | SigNoz dashboards for cost, LLM usage, agent activity | **Not done**, panels documented and ready to build | see [Section 10](#10-signoz-dashboards-alerts-exceptions-llm-cost) |
 
-**What you can already show, right now, with zero manual curls after the initial failure trigger:** break the DB or spike the cost, SigNoz notices on its own, calls the agent on its own, the agent fixes it and logs why, on its own. That's Tier 1, proven twice with real alerts. For a failure nobody anticipated, Tier 2 will investigate it with a real LLM the moment `ANTHROPIC_API_KEY` is set, everything downstream of that is already built and tested against real SigNoz data.
+**What you can already show, right now, with zero manual curls after the initial failure trigger:** break the DB or spike the cost, SigNoz notices on its own, calls the agent on its own, the agent fixes it and logs why, on its own. That's Tier 1, proven twice with real alerts. For a failure nobody anticipated, Tier 2 will investigate it with a real LLM the moment a provider API key (Gemini by default) is set, everything downstream of that is already built and tested against real SigNoz data.
 
 ---
 
@@ -85,7 +85,7 @@ Plain-English requirements, written so a non-technical reviewer can check them o
 | FR-WS-04 | Apply an approved fix by updating the matching setting on control-plane. | Done, verified live for both known failures. |
 | FR-WS-05 | Record every alert it handles as an incident on control-plane, whether the fix was applied, blocked, or no action was taken. | Done, verified for Tier 1 and Tier 2 alike. |
 | FR-WS-06 | Expose a liveness endpoint independent of alert traffic. | Done |
-| FR-WS-07 | For alerts Tier 1 doesn't recognize, investigate using real SigNoz telemetry (traces, error spans) as tools for an LLM, instead of giving up. | **Done**, the tools and the tool-calling loop are real and tested against live SigNoz data (see [Section 6](#6-the-ai--agent-layer-in-full)). Needs `ANTHROPIC_API_KEY` to make the actual model call. |
+| FR-WS-07 | For alerts Tier 1 doesn't recognize, investigate using real SigNoz telemetry (traces, error spans) as tools for an LLM, instead of giving up. Provider-agnostic: works with Gemini, Anthropic, or OpenAI without code changes. | **Done**, the tools and the tool-calling loop are real and tested against live SigNoz data (see [Section 6](#6-the-ai--agent-layer-in-full)). Needs a real API key for whichever `LLM_PROVIDER` is active to make the actual model call. |
 | FR-WS-08 | Tier 2's proposed action must be restricted to the same 3 known setting keys as Tier 1, anything else discarded; the whole investigation must have a hard timeout; every LLM/tool call must be traced. | Done: `VALID_KEYS` allowlist, 10s timeout via `Promise.race`, manual OTel spans with `gen_ai.*` attributes on the LLM call and `signoz.*` attributes on each tool call. |
 
 ---
@@ -166,7 +166,7 @@ watcher-service/
       investigate.js            # NEW: Tier 2 orchestrator, LLM tool-calling loop
     clients/
       controlPlaneClient.js     # PUT /settings, POST /incidents, GET /settings
-      llmClient.js               # NEW: wraps the Anthropic SDK call
+      llmClient.js               # NEW: picks the LLM provider (Gemini/Anthropic/OpenAI) via the Vercel AI SDK
       signozClient.js            # NEW: real SigNoz Query API v4 client (read-only)
 ```
 
@@ -216,7 +216,7 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 
 **Tier 1 (deterministic, unchanged from before):** the 2 known failures resolve instantly via plain `if/else` on the alert's rule name. No LLM involved, no unpredictability. This is the reliability backbone, proven live twice with real SigNoz-fired alerts.
 
-**Tier 2 (new, the actual "AI-native" part):** when an alert's name matches neither known pattern, `diagnose.js` hands off to `investigate.js`, which runs a real LLM tool-calling loop against Claude, using SigNoz's own Query API as the LLM's "eyes." This is the functionally necessary use of AI in this system, not decoration, it's the only thing that handles a failure nobody anticipated at all.
+**Tier 2 (new, the actual "AI-native" part):** when an alert's name matches neither known pattern, `diagnose.js` hands off to `investigate.js`, which runs a real LLM tool-calling loop (Gemini by default, swappable to Anthropic or OpenAI) using SigNoz's own Query API as the model's "eyes." This is the functionally necessary use of AI in this system, not decoration, it's the only thing that handles a failure nobody anticipated at all.
 
 ### Guardrails (why this is safe to demo)
 
@@ -226,12 +226,24 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 | Read-only investigation | `signozClient.js` only ever calls `query_range`. There is no function in this codebase that can write to SigNoz. |
 | Bounded tools | The LLM is given exactly 2 tools: `query_recent_traces`, `query_error_spans`. No shell, no file access, no arbitrary HTTP. |
 | Hard timeout | The whole investigation races against a 10s timer (`INVESTIGATION_TIMEOUT_MS`). On timeout it resolves to a safe "no action, needs human" result instead of hanging. |
-| Missing API key = safe no-op | If `ANTHROPIC_API_KEY` isn't set, `investigate.js` skips straight to the fallback result. Verified: an unrecognized alert with no key configured left settings untouched and logged `"no automated fix, ANTHROPIC_API_KEY not configured"`. |
+| Missing API key = safe no-op | If the API key for the active `LLM_PROVIDER` isn't set, `investigate.js` skips straight to the fallback result. Verified for all 3 providers via the code path: an unrecognized alert with `LLM_PROVIDER=gemini` and no `GOOGLE_API_KEY` left settings untouched and logged `"no automated fix, gemini API key not configured"`. |
 | No privileged path for AI-proposed actions | Tier 2's output goes through the exact same `safetyCheck.js` as Tier 1, in the exact same `remediation.service.js` code path. No special case. |
 | Unconditional audit trail | `reportIncident()` fires whether the outcome was applied, blocked, or "insufficient evidence." Nothing is silently dropped, for either tier. |
 | Everything is traced | Every LLM call and every SigNoz tool call gets its own OpenTelemetry span, so the agent's *own investigation* is visible as a trace in SigNoz, not just the infra it's investigating. |
 
 **Will the agent modify code? No.** Its entire vocabulary of possible actions, in either tier, is 3 named config switches on control-plane. It cannot write files, run shell commands, deploy, or touch source code. That's not a limitation we're apologizing for, it's the design: safety through a small, enumerable action space, not through hoping a model behaves.
+
+### Provider-agnostic by design
+
+`investigate.js` never imports an LLM provider's SDK directly. It imports `generateText`/`tool` from the [Vercel AI SDK](https://sdk.vercel.ai) (`ai` package) and calls `llmClient.getModel()`, which is the only place that knows about `@ai-sdk/google`, `@ai-sdk/anthropic`, or `@ai-sdk/openai`. Switching models is one env var:
+
+| `LLM_PROVIDER` | Package used | Default model | Key env var |
+|---|---|---|---|
+| `gemini` (default) | `@ai-sdk/google` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
+| `anthropic` | `@ai-sdk/anthropic` | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
+| `openai` | `@ai-sdk/openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+
+Override the model for any provider with `LLM_MODEL`. Everything else, the tool-calling loop, guardrails, span attributes, is identical regardless of which row is active, that's the point of building on the AI SDK's unified interface instead of a provider-specific SDK.
 
 ### Tier 2's exact flow, verified against real infrastructure
 
@@ -239,29 +251,32 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 1. SigNoz fires an alert whose name matches neither known pattern
 2. POST watcher-service:4002/alerts/webhook
 3. diagnose.js's Tier 1 fails to match -> calls investigate(alertPayload)
-4. investigate.js starts a bounded loop (max 4 turns) against Claude:
+4. investigate.js calls the AI SDK's generateText() against whichever model
+   llmClient.getModel() returns (Gemini by default), with a bounded step
+   budget (maxSteps: 4) and 2 tools:
      system prompt: "investigate using your tools, respond with ONLY
                       {diagnosis, action|null}, action must be one of the
                       3 known keys"
-   a. Claude requests tool query_recent_traces({serviceName, minutes})
+   a. Model requests tool query_recent_traces({serviceName, minutes})
       -> signozClient.queryRecentTraces() -> real POST to SigNoz's
          /api/v4/query_range, SIGNOZ-API-KEY header, real span rows back
-   b. Claude may request query_error_spans(...) for more evidence
-   c. Claude returns final JSON: diagnosis + action (or null)
+   b. Model may request query_error_spans(...) for more evidence
+   c. Model returns final text: diagnosis + action (or null) as JSON
 5. Action validated against VALID_KEYS (discarded if not one of the 3 keys)
 6. Same safetyCheck.js as Tier 1 evaluates it
 7. If allowed and an action exists: PUT control-plane/settings
 8. POST control-plane/incidents, always
-9. Every step above (each tool call, the LLM call itself) is its own OTel
-   span, nested under an "investigate.tier2" parent span
+9. Each tool call gets its own OTel span; the overall investigation span
+   carries gen_ai.request.model, gen_ai.usage.input_tokens/output_tokens,
+   and investigate.provider, all nested under "investigate.tier2"
 ```
 
 **Verified today, without a real LLM key yet:**
 - `signozClient.queryRecentTraces('worker-service', 15)` called directly inside the running container returned 10 real span rows.
 - The `investigate.tier2` span it produces is a real, queryable trace, confirmed by querying SigNoz for `watcher-service`'s own spans and finding it in the list.
-- Sending an unrecognized alert with no `ANTHROPIC_API_KEY` configured correctly left control-plane's settings untouched and logged an honest incident explaining why.
+- Sending an unrecognized alert with `LLM_PROVIDER=gemini` and no `GOOGLE_API_KEY` configured correctly left control-plane's settings untouched and logged `"no automated fix, gemini API key not configured"`, confirming the provider-aware fallback message works.
 
-**What's left to see the LLM actually reason:** set `ANTHROPIC_API_KEY` (and `SIGNOZ_API_KEY`, see below) and fire an unrecognized alert. Nothing else needs to change.
+**What's left to see the LLM actually reason:** set the API key matching `LLM_PROVIDER` (Gemini by default, see below for where to get one) plus `SIGNOZ_API_KEY`, and fire an unrecognized alert. Nothing else needs to change, `investigate.js` never imports a provider SDK directly, it only calls `llmClient.getModel()`.
 
 ### Two gotchas found the hard way (worth knowing before you touch this)
 
@@ -323,11 +338,11 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
    |            control-plane            |<------|      watcher-service      |
    |   3 settings + incident log (Postgres)|PUT/POST| Tier 1 (done) +         |
    +------------------------------------+       |  Tier 2 (done, needs a    |
-                                                 |  real ANTHROPIC_API_KEY)  |
+                                                 |  real provider API key)   |
                                                  +--------------------------+
 ```
 
-**New pieces vs. Section 4's current architecture:** just the React/Next.js dashboard (Section 9) and the SigNoz dashboards (Section 10). Everything backend, including Tier 2's full pipeline, is already built and tested against real infrastructure, it's waiting on a real `ANTHROPIC_API_KEY` to actually invoke the model, not on more code.
+**New pieces vs. Section 4's current architecture:** just the React/Next.js dashboard (Section 9) and the SigNoz dashboards (Section 10). Everything backend, including Tier 2's full pipeline, is already built and tested against real infrastructure, it's waiting on a real API key for whichever `LLM_PROVIDER` is active (Gemini by default) to actually invoke the model, not on more code.
 
 ---
 
@@ -381,7 +396,7 @@ Both point at `http://watcher-service:4002/alerts/webhook`. To add a 3rd (e.g. f
 
 ### 10.2 Exceptions
 
-SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordException()` API. This codebase calls it explicitly in `investigate.js`'s catch block, so any failure inside Tier 2 (a malformed LLM response, a network error calling Anthropic, a bug) will show up there, not just in `docker compose logs`. To verify once `ANTHROPIC_API_KEY` is set: check SigNoz's Exceptions tab after a Tier 2 run, especially useful for debugging a misbehaving investigation without needing container log access.
+SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordException()` API. This codebase calls it explicitly in `investigate.js`'s catch block, so any failure inside Tier 2 (a malformed LLM response, a network error calling the LLM provider, a bug) will show up there, not just in `docker compose logs`. To verify once a provider API key is set: check SigNoz's Exceptions tab after a Tier 2 run, especially useful for debugging a misbehaving investigation without needing container log access.
 
 ### 10.3 Dashboards to build (none exist yet, this is the plan)
 
@@ -400,7 +415,7 @@ All of these are span **attributes already being set** by the code in this repo 
 
 ### 10.4 LLM cost, concretely
 
-Anthropic's per-token pricing multiplied by `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` (already captured per LLM call span) gives real dollar cost per investigation. A dashboard panel summing tokens over a time range, multiplied by the model's published rate, turns into a literal "here's what our AI agent cost us today" number, worth having on screen next to `estimated_cost_usd` (the fake business cost worker-service reports), the contrast between the two costs is a good demo beat.
+Whichever provider's per-token pricing (Gemini's, Anthropic's, or OpenAI's, published on each provider's site) multiplied by `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` (already captured on the investigation span) gives real dollar cost per investigation. A dashboard panel summing tokens over a time range, multiplied by the active model's rate, turns into a literal "here's what our AI agent cost us today" number, worth having on screen next to `estimated_cost_usd` (the fake business cost worker-service reports), the contrast between the two costs is a good demo beat.
 
 ---
 
@@ -410,7 +425,7 @@ Anthropic's per-token pricing multiplied by `gen_ai.usage.input_tokens` / `gen_a
 2. ~~Create both real SigNoz alert rules~~ **Done.**
 3. ~~Wire `diagnose.js`, `safetyCheck.js`, `remediation.service.js`~~ **Done.**
 4. ~~Build Tier 2: SigNoz query tools, LLM tool-calling loop, guardrails, tracing~~ **Done**, verified against real SigNoz data.
-5. **Set `ANTHROPIC_API_KEY` and `SIGNOZ_API_KEY`** in a root `.env` file (see Section 6's "getting a SigNoz API key"), then fire an alert with a name that matches neither known pattern and watch Tier 2 actually reason.
+5. **Set `GOOGLE_API_KEY` (or switch `LLM_PROVIDER` and set the matching key) and `SIGNOZ_API_KEY`** in a root `.env` file (see Section 6's "getting a SigNoz API key"), then fire an alert with a name that matches neither known pattern and watch Tier 2 actually reason.
 6. **Build the UI** (Section 9).
 7. **Build the SigNoz dashboards** (Section 10.3), all the underlying data already exists.
 8. **Rehearse the full loop live**: break DB, watch it self-heal (Tier 1); fire an unrecognized alert, watch the LLM investigate and decide (Tier 2); show the dashboards updating; show the trace of the agent's own reasoning in SigNoz.
@@ -425,7 +440,7 @@ Anthropic's per-token pricing multiplied by `gen_ai.usage.input_tokens` / `gen_a
 | control-plane | Yes | n/a (it *is* the store) | Yes | Yes, all 3 services' traces reach SigNoz |
 | worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels done (FR-WK-08) |
 | watcher-service (Tier 1) | Yes | Yes | Yes | Both known failures verified end to end with real SigNoz-fired alerts |
-| watcher-service (Tier 2) | Yes | Yes | Yes | SigNoz query tools + tool-calling loop verified with real data; needs `ANTHROPIC_API_KEY` for the model call itself |
+| watcher-service (Tier 2) | Yes | Yes | Yes | Provider-agnostic (Gemini/Anthropic/OpenAI); SigNoz query tools + tool-calling loop verified with real data; needs a real key for the active provider for the model call itself |
 | UI | No | | | See Section 9 |
 | SigNoz dashboards | No | | | See Section 10.3 |
 
@@ -439,7 +454,7 @@ Anthropic's per-token pricing multiplied by `gen_ai.usage.input_tokens` / `gen_a
 - [x] Both real SigNoz alert rules created and confirmed firing automatically end to end
 - [x] `diagnose.js`, `safetyCheck.js`, `remediation.service.js` fully wired
 - [x] Tier 2 built: real SigNoz Query API client, LLM tool-calling loop, guardrails, OTel spans, all verified against live infrastructure
-- [ ] `ANTHROPIC_API_KEY` set and a live Tier 2 investigation run end to end with a real model response
+- [ ] A provider API key set (Gemini by default) and a live Tier 2 investigation run end to end with a real model response
 - [ ] SigNoz dashboards built (Section 10.3)
 - [ ] React/Next.js UI built with the panels in Section 9
 - [x] Full Tier 1 loop demoed with zero manual curls after the initial failure trigger, for both failures, with real SigNoz-fired alerts
@@ -455,10 +470,10 @@ Requires Docker Desktop running and SigNoz already up (`foundryctl cast`, see `c
 Create a `.env` file in the repo root (gitignored, never commit it):
 ```
 SIGNOZ_API_KEY=<from SigNoz Settings -> Service Accounts, see Section 6>
-ANTHROPIC_API_KEY=<from console.anthropic.com>
-ANTHROPIC_MODEL=claude-sonnet-5
+LLM_PROVIDER=gemini
+GOOGLE_API_KEY=<from https://aistudio.google.com/apikey>
 ```
-Without these, everything still works, Tier 2 just safely no-ops on unrecognized alerts instead of investigating.
+Switching providers is just changing `LLM_PROVIDER` to `anthropic` or `openai` and setting the matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` instead. Without any of these, everything still works, Tier 2 just safely no-ops on unrecognized alerts instead of investigating.
 
 ### 2. Start everything (same command, all platforms)
 
@@ -517,7 +532,7 @@ curl -s -X POST http://localhost:4002/alerts/webhook -H "Content-Type: applicati
 }'
 docker compose logs watcher-service --tail 10
 ```
-Without `ANTHROPIC_API_KEY`: settings unchanged, incident logged as `"no automated fix, ANTHROPIC_API_KEY not configured"`. With it: the LLM actually investigates using SigNoz's telemetry and may propose a fix.
+Without a key for the active provider: settings unchanged, incident logged as `"no automated fix, gemini API key not configured"` (or `anthropic`/`openai`, matching whichever `LLM_PROVIDER` is set). With it: the LLM actually investigates using SigNoz's telemetry and may propose a fix.
 
 ### 5. Watch it in SigNoz
 

@@ -52,11 +52,16 @@ services:
       # by inspecting the network directly, "signoz" (the old value here)
       # does not resolve and Tier 2's queries would silently return nothing.
       SIGNOZ_URL: http://signoz-signoz-0:8080
-      # Both read from a root .env file (gitignored). Blank/unset = Tier 2
-      # (AI investigation of unrecognized alerts) safely no-ops.
+      # All read from a root .env file (gitignored). Only the key matching
+      # LLM_PROVIDER needs a real value, the rest can stay blank. Blank/unset
+      # for the active provider = Tier 2 (AI investigation of unrecognized
+      # alerts) safely no-ops instead of erroring.
       SIGNOZ_API_KEY: ${SIGNOZ_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       PORT: 4002
     ports:
       - "4002:4002"

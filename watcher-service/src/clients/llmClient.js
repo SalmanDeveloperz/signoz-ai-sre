@@ -1,30 +1,46 @@
-// Pattern: Client. Isolates the Anthropic SDK call behind one function.
-// Tier 2's actual "brain": given the alert and a set of tools, asks Claude
-// to investigate and decide. investigate.js owns the tool-calling loop and
-// the OTel spans around each turn; this file only knows how to make one
-// call to the API, same separation of concerns as every other client in
-// this codebase.
+// Pattern: Client. Picks and constructs whichever LLM provider is configured
+// via LLM_PROVIDER, using the Vercel AI SDK's unified model interface. This
+// is the ONLY file in the codebase that knows provider-specific package
+// names. investigate.js just calls getModel() and hands the result to the
+// AI SDK's generateText(), it never touches a provider SDK directly.
+// Swapping providers, or adding a new one, is a change here only.
 
-const Anthropic = require('@anthropic-ai/sdk');
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || 'gemini').toLowerCase();
+const LLM_MODEL = process.env.LLM_MODEL || '';
 
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
-const client = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+const DEFAULT_MODELS = {
+  gemini: 'gemini-2.0-flash',
+  anthropic: 'claude-sonnet-5',
+  openai: 'gpt-4o-mini',
+};
 
 function isConfigured() {
-  return Boolean(client);
+  if (LLM_PROVIDER === 'gemini') return Boolean(GOOGLE_API_KEY);
+  if (LLM_PROVIDER === 'anthropic') return Boolean(ANTHROPIC_API_KEY);
+  if (LLM_PROVIDER === 'openai') return Boolean(OPENAI_API_KEY);
+  return false;
 }
 
-async function createMessage({ system, messages, tools }) {
-  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
-  return client.messages.create({
-    model: ANTHROPIC_MODEL,
-    max_tokens: 1024,
-    system,
-    messages,
-    tools,
-  });
+function getModel() {
+  const modelId = LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER];
+
+  if (LLM_PROVIDER === 'gemini') {
+    const { createGoogleGenerativeAI } = require('@ai-sdk/google');
+    return createGoogleGenerativeAI({ apiKey: GOOGLE_API_KEY })(modelId);
+  }
+  if (LLM_PROVIDER === 'anthropic') {
+    const { createAnthropic } = require('@ai-sdk/anthropic');
+    return createAnthropic({ apiKey: ANTHROPIC_API_KEY })(modelId);
+  }
+  if (LLM_PROVIDER === 'openai') {
+    const { createOpenAI } = require('@ai-sdk/openai');
+    return createOpenAI({ apiKey: OPENAI_API_KEY })(modelId);
+  }
+  throw new Error(`Unknown LLM_PROVIDER: ${LLM_PROVIDER}`);
 }
 
-module.exports = { isConfigured, createMessage, ANTHROPIC_MODEL };
+module.exports = { isConfigured, getModel, LLM_PROVIDER, LLM_MODEL: LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER] };

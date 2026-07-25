@@ -4,56 +4,37 @@
 // LLM investigates using real SigNoz telemetry as tools, then proposes a
 // diagnosis and, optionally, a fix.
 //
+// Provider-agnostic on purpose: this file calls the Vercel AI SDK's
+// generateText() with a model object from llmClient.getModel(). It never
+// imports a provider SDK (Anthropic/Google/OpenAI) directly, so switching
+// LLM_PROVIDER in .env is the only change needed to run on a different model.
+//
 // Guardrails enforced here, not left to the model's good behavior:
 //   - Tools are read-only queries against SigNoz (signozClient.js never
 //     calls anything that mutates SigNoz state).
 //   - The model can only propose one of the 3 known control-plane setting
 //     keys (VALID_KEYS). Anything else is discarded, never applied.
 //   - The whole investigation has a hard timeout. On timeout, failure, or a
-//     missing ANTHROPIC_API_KEY, this falls back to a safe "no action,
-//     needs human" result instead of hanging or guessing.
+//     missing API key for the configured provider, this falls back to a
+//     safe "no action, needs human" result instead of hanging or guessing.
 //   - The proposed action still passes through safetyCheck.js afterward in
 //     remediation.service.js, same as Tier 1's path. No special privilege
 //     for an AI-originated action.
-//   - Every LLM call and every tool call gets its own OTel span, so the
-//     agent's own investigation is visible as a trace in SigNoz, not just
-//     the infra it's investigating.
+//   - Every tool call gets its own OTel span, and the overall investigation
+//     span carries gen_ai.* usage attributes, so the agent's own
+//     investigation is visible as a trace in SigNoz, not just the infra
+//     it's investigating.
 
 const { trace } = require('@opentelemetry/api');
+const { generateText, tool } = require('ai');
+const { z } = require('zod');
 const llmClient = require('../clients/llmClient');
 const signozClient = require('../clients/signozClient');
 
 const VALID_KEYS = ['use_backup_data', 'active_model', 'retry_enabled'];
 const INVESTIGATION_TIMEOUT_MS = 10000;
-const MAX_TOOL_TURNS = 4;
+const MAX_STEPS = 4;
 const TRACER_NAME = 'watcher-service';
-
-const TOOLS = [
-  {
-    name: 'query_recent_traces',
-    description: "List recent spans for a service, to see what it's been doing.",
-    input_schema: {
-      type: 'object',
-      properties: {
-        serviceName: { type: 'string' },
-        minutes: { type: 'number' },
-      },
-      required: ['serviceName'],
-    },
-  },
-  {
-    name: 'query_error_spans',
-    description: 'List recent error spans (status.code = STATUS_CODE_ERROR) for a service.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        serviceName: { type: 'string' },
-        minutes: { type: 'number' },
-      },
-      required: ['serviceName'],
-    },
-  },
-];
 
 const SYSTEM_PROMPT = `You are an SRE investigation agent for a small system with 3 services:
 worker-service (handles support tickets), control-plane (holds 3 settings), and
@@ -82,66 +63,67 @@ function parseFinalAnswer(text) {
   }
 }
 
-async function callTool(name, input) {
-  const tracer = trace.getTracer(TRACER_NAME);
-  return tracer.startActiveSpan(`signoz.${name}`, async (span) => {
-    span.setAttribute('signoz.tool', name);
-    span.setAttribute('signoz.service_name', input.serviceName || '');
-    let result;
-    if (name === 'query_recent_traces') {
-      result = await signozClient.queryRecentTraces(input.serviceName, input.minutes);
-    } else if (name === 'query_error_spans') {
-      result = await signozClient.queryErrorSpans(input.serviceName, input.minutes);
-    } else {
-      result = { ok: false, reason: `unknown tool: ${name}` };
-    }
-    span.setAttribute('signoz.ok', Boolean(result.ok));
-    span.end();
-    return result;
-  });
+function buildTools(tracer) {
+  return {
+    query_recent_traces: tool({
+      description: "List recent spans for a service, to see what it's been doing.",
+      parameters: z.object({
+        serviceName: z.string().describe('e.g. worker-service, control-plane, watcher-service'),
+        minutes: z.number().optional().describe('lookback window, defaults to 15'),
+      }),
+      execute: async ({ serviceName, minutes }) =>
+        tracer.startActiveSpan('signoz.query_recent_traces', async (span) => {
+          span.setAttribute('signoz.tool', 'query_recent_traces');
+          span.setAttribute('signoz.service_name', serviceName);
+          const result = await signozClient.queryRecentTraces(serviceName, minutes);
+          span.setAttribute('signoz.ok', Boolean(result.ok));
+          span.end();
+          return result;
+        }),
+    }),
+    query_error_spans: tool({
+      description: 'List recent error spans (status.code = STATUS_CODE_ERROR) for a service.',
+      parameters: z.object({
+        serviceName: z.string(),
+        minutes: z.number().optional(),
+      }),
+      execute: async ({ serviceName, minutes }) =>
+        tracer.startActiveSpan('signoz.query_error_spans', async (span) => {
+          span.setAttribute('signoz.tool', 'query_error_spans');
+          span.setAttribute('signoz.service_name', serviceName);
+          const result = await signozClient.queryErrorSpans(serviceName, minutes);
+          span.setAttribute('signoz.ok', Boolean(result.ok));
+          span.end();
+          return result;
+        }),
+    }),
+  };
 }
 
 async function runInvestigation(alertPayload) {
   const tracer = trace.getTracer(TRACER_NAME);
   return tracer.startActiveSpan('investigate.tier2', async (span) => {
+    span.setAttribute('investigate.provider', llmClient.LLM_PROVIDER);
+    span.setAttribute('gen_ai.request.model', llmClient.LLM_MODEL);
     try {
       if (!llmClient.isConfigured()) {
         span.setAttribute('investigate.skipped', 'no_api_key');
-        return safeFallback('ANTHROPIC_API_KEY not configured');
+        return safeFallback(`${llmClient.LLM_PROVIDER} API key not configured`);
       }
 
-      const messages = [{ role: 'user', content: `Alert payload:\n${JSON.stringify(alertPayload)}` }];
+      const result = await generateText({
+        model: llmClient.getModel(),
+        system: SYSTEM_PROMPT,
+        prompt: `Alert payload:\n${JSON.stringify(alertPayload)}`,
+        tools: buildTools(tracer),
+        maxSteps: MAX_STEPS,
+      });
 
-      for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-        const response = await tracer.startActiveSpan('llm.investigate_turn', async (llmSpan) => {
-          const res = await llmClient.createMessage({ system: SYSTEM_PROMPT, messages, tools: TOOLS });
-          llmSpan.setAttribute('gen_ai.request.model', llmClient.ANTHROPIC_MODEL);
-          llmSpan.setAttribute('gen_ai.usage.input_tokens', res.usage?.input_tokens || 0);
-          llmSpan.setAttribute('gen_ai.usage.output_tokens', res.usage?.output_tokens || 0);
-          llmSpan.setAttribute('gen_ai.response.stop_reason', res.stop_reason || '');
-          llmSpan.end();
-          return res;
-        });
+      span.setAttribute('gen_ai.usage.input_tokens', result.usage?.promptTokens || 0);
+      span.setAttribute('gen_ai.usage.output_tokens', result.usage?.completionTokens || 0);
+      span.setAttribute('investigate.steps', result.steps?.length || 0);
 
-        messages.push({ role: 'assistant', content: response.content });
-
-        if (response.stop_reason !== 'tool_use') {
-          const textBlock = response.content.find((block) => block.type === 'text');
-          span.setAttribute('investigate.turns', turn + 1);
-          return parseFinalAnswer(textBlock ? textBlock.text : '');
-        }
-
-        const toolResults = [];
-        for (const block of response.content) {
-          if (block.type !== 'tool_use') continue;
-          const result = await callTool(block.name, block.input || {});
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
-        }
-        messages.push({ role: 'user', content: toolResults });
-      }
-
-      span.setAttribute('investigate.turns', MAX_TOOL_TURNS);
-      return safeFallback('investigation exceeded max turns');
+      return parseFinalAnswer(result.text || '');
     } catch (err) {
       span.recordException(err);
       return safeFallback(`investigation error: ${err.message}`);
