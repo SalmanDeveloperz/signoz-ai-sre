@@ -347,9 +347,9 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 
 ## 11. Exact steps to close the gap
 
-1. **Capture a real SigNoz alert payload.** Create one throwaway alert rule in the SigNoz UI, point it at watcher-service's webhook (or webhook.site first), force it to fire, copy the exact JSON into `CONTRACTS.md` Section 2. Confirms the real field name for the alert's rule identifier.
-2. **Create the 2 real SigNoz alert rules**: worker-service error rate (Failure A), `estimated_cost_usd` rate of change (Failure B). Point both at watcher-service's webhook. The span attributes these rules need (FR-WK-08) are already in place.
-3. **Wire `diagnose.js`**: branch on the real rule name from step 1, add the `else` branch for UC5 (unrecognized alert, do nothing dangerous, log it anyway).
+1. **Capture a real SigNoz alert payload.** Done on 2026-07-25: created a Metric-Based Alert (`db-error-rate-alert`) on `signoz_calls_total` filtered by `service.name='worker-service' AND status.code='STATUS_CODE_ERROR'`, a webhook channel pointed at `http://watcher-service:4002/alerts/webhook`, drove real ticket traffic through a broken DB until SigNoz fired the rule **automatically**, and captured the real payload into `CONTRACTS.md` Section 2. Rule-name field confirmed: `alerts[0].labels.alertname`.
+2. **Create the 2nd real SigNoz alert rule**: `estimated_cost_usd` rate of change (Failure B), same pattern as Failure A above. Point it at the same `watcher-service` webhook channel (already exists, reusable).
+3. **Wire `diagnose.js`**: branch on `alerts[0].labels.alertname` (now confirmed), add the `else` branch for UC5 (unrecognized alert, do nothing dangerous, log it anyway).
 4. **Wire `safetyCheck.js`**: the one hardcoded UC3 rule (block `retry_enabled=false` while `use_backup_data=true`).
 5. **Uncomment steps 2-4 in `remediation.service.js`**, connecting the already-working `controlPlaneClient.js` functions.
 6. **(Recommended) Build option A from Section 6**: the LLM-narrated incident text, this is the smallest real "AI" addition with the least demo risk.
@@ -374,8 +374,8 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 - [x] watcher-service skeleton built, receives webhooks, responds correctly
 - [x] All 4 containers build and run together via `docker compose up`
 - [x] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
-- [ ] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
-- [ ] 2 real SigNoz alert rules created and firing
+- [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
+- [x] 1st real SigNoz alert rule (`db-error-rate-alert`) created and confirmed firing automatically end to end into watcher-service; 2nd (cost-spike) still needed
 - [ ] `diagnose.js` and `safetyCheck.js` wired for real, including the unrecognized-alert case
 - [ ] `remediation.service.js` steps 2-4 uncommented and working
 - [ ] At least one real AI/LLM call somewhere in the loop (Section 6, option A minimum)
