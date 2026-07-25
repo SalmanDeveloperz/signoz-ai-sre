@@ -55,6 +55,18 @@ services:
     depends_on: [control-plane]
     networks: [signoz-network]
 
+  worker-service:
+    build: ./worker-service
+    environment:
+      OTEL_SERVICE_NAME: worker-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://signoz-ingester:4318/v1/traces
+      CONTROL_PLANE_URL: http://control-plane:4001
+      PORT: 4000
+    ports:
+      - "4000:4000"
+    depends_on: [control-plane]
+    networks: [signoz-network]
+
 # The network SigNoz already created via foundryctl cast. `external: true` means
 # compose joins it rather than trying to create/own it.
 networks:
