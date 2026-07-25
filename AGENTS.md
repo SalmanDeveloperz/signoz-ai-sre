@@ -44,7 +44,7 @@ signoz-ai-sre/
 - **control-plane**: implemented and smoke-tested. All 7 files built, `npm install` done, migration run against a standalone `app-postgres` container (on the `signoz-network` Docker network, host port 55432 mapped since 5432 is taken locally), and all 4 endpoints verified against real data. See `control-plane/README.md` for full details. Not yet run inside its own Docker container, and not yet confirmed in SigNoz's service list (no `docker-compose.yml` exists in the repo yet to wire that up).
 - **worker-service**: not started yet.
 - **watcher-service**: not started yet.
-- **CONTRACTS.md**: Sections 1 (settings), 3 (telemetry labels), 4 (failure scenarios), and 5 (incident report) are finalized. Section 2 (the real SigNoz alert webhook payload) is still a placeholder, it needs a human to manually fire a test alert and paste in the real payload before watcher-service's webhook handler can be finished for real.
+- **CONTRACTS.md**: All 5 sections are now finalized. Section 2 (the real SigNoz alert webhook payload) was filled in on 2026-07-25 using a real, automatically-fired `db-error-rate-alert` (Metric-Based Alert on `signoz_calls_total`, filtered `service.name='worker-service' AND status.code='STATUS_CODE_ERROR'`), not a guess. The rule-name field is `alerts[0].labels.alertname`. `diagnose.js` can now be written for real.
 - **SigNoz**: assumed self-hosted and running via Foundry (see `casting.yaml`), UI reachable at `http://localhost:8080`.
 - **Alert rules / dashboards**: not yet created in SigNoz.
 
@@ -98,7 +98,7 @@ wire in the real logic.
 
 **Read first:** `CONTRACTS.md` Sections 1, 2, 3, 4, and 5, all of them, this service depends on the most contracts.
 
-**Important:** Section 2 (the real SigNoz alert payload) may still be a placeholder. Check with whoever owns SigNoz setup before assuming it's final, do not build your webhook parsing logic against a guessed shape.
+**Important:** Section 2 (the real SigNoz alert payload) is now filled in with a real captured payload, safe to build `diagnose.js`'s real branches against.
 
 **Your job:** receive SigNoz's alert webhook, figure out what's wrong, decide a fix, run it past a safety check, apply it through control-plane, and write an incident report.
 
@@ -156,7 +156,7 @@ build those on Day 2 and 3.
 
 ## Definition of done for Day 1
 
-- [ ] `CONTRACTS.md` fully filled in, including a real, tested Section 2 payload
+- [x] `CONTRACTS.md` fully filled in, including a real, tested Section 2 payload
 - [ ] All 3 services scaffolded with `instrumentation.js` in place, service name set correctly per service
 - [ ] `docker-compose up` brings up all 3 services plus Postgres with no crash loops
 - [ ] `POST /tickets` (worker-service) and `POST /alerts/webhook` (watcher-service) both return 200 and show up in SigNoz's service list with the correct names

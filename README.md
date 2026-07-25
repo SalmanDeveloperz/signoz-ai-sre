@@ -82,10 +82,10 @@ Plain-English requirements, written so a non-technical reviewer can check them o
 | ID | Requirement | Status |
 |---|---|---|
 | FR-WS-01 | Accept SigNoz's alert webhook and respond immediately, before doing any analysis, so SigNoz's call never times out or retries the same alert. | Done |
-| FR-WS-02 | Diagnose which of the known failures an alert represents, and decide the one correct fix for it. | **Not done**, stub always returns "no diagnosis" |
-| FR-WS-03 | Check a proposed fix against a hardcoded safety rule before applying it, and refuse unsafe ones. | **Not done**, stub always allows |
-| FR-WS-04 | Apply an approved fix by updating the matching setting on control-plane. | **Not done**, commented out |
-| FR-WS-05 | Record every alert it handles as an incident on control-plane, whether the fix was applied or blocked. | **Not done**, commented out |
+| FR-WS-02 | Diagnose which of the known failures an alert represents, and decide the one correct fix for it. | **Done.** Branches on `alerts[0].labels.alertname` (confirmed real field), handles `db-error-rate`, `cost-spike`, and an explicit unrecognized-alert case that takes no action. |
+| FR-WS-03 | Check a proposed fix against a hardcoded safety rule before applying it, and refuse unsafe ones. | **Done.** Blocks `retry_enabled=false` while `use_backup_data=true`; unit-verified directly. |
+| FR-WS-04 | Apply an approved fix by updating the matching setting on control-plane. | **Done.** Verified live: a simulated `db-error-rate-alert` webhook flips `use_backup_data` to `true` automatically. |
+| FR-WS-05 | Record every alert it handles as an incident on control-plane, whether the fix was applied or blocked. | **Done.** Every test alert produced a real incident row, including the unrecognized-alert case (`action_taken:"none"`). |
 | FR-WS-06 | Expose a liveness endpoint independent of alert traffic. | Done |
 | FR-WS-07 (stretch) | Query SigNoz directly for recent telemetry to confirm or enrich a diagnosis beyond the alert payload alone. | **Not done**, stub returns empty data |
 
@@ -103,14 +103,17 @@ Plain-English requirements, written so a non-technical reviewer can check them o
                        v
    +------------------------------------+
    |               SigNoz                |  observability platform, port 8080
-   |  (no alert rules configured yet)    |
+   |  1 real alert rule live:            |
+   |  db-error-rate-alert (Failure A)    |
    +--------------------------------------+
-                       :
-                (webhook not wired to any real alert yet)
+                       |
+              webhook fires automatically
                        v
    +------------------------------------+
    |           watcher-service           |  Node/Express, port 4002
-   |  receives + logs alerts, no action  |
+   |  diagnose -> safety-check -> apply  |
+   |  -> report, fully wired for both    |
+   |  known failures + unrecognized case |
    +------------------+-------------------+
                        |
         reads/writes settings, writes incidents
@@ -152,12 +155,12 @@ watcher-service/
     routes/{alerts,status}.routes.js
     controllers/{alerts,status}.controller.js
     services/
-      remediation.service.js   # the agent loop, only step 1 of 4 wired
-      diagnose.js               # STUB
-      safetyCheck.js            # STUB
+      remediation.service.js   # the agent loop, all 4 steps wired and verified
+      diagnose.js               # branches on alerts[0].labels.alertname
+      safetyCheck.js            # the one hardcoded UC3 rule, live
     clients/
-      controlPlaneClient.js     # working, unused until remediation is wired
-      signozClient.js           # STUB
+      controlPlaneClient.js     # working, now actually called by remediation
+      signozClient.js           # STUB (UC6 stretch only)
 ```
 
 No React/Next.js app exists yet anywhere in the repo (see [Section 10](#10-the-ui-reactnextjs)). No LLM client exists yet anywhere in the repo (see [Section 6](#6-the-ai--agent-layer-in-full)).
@@ -194,24 +197,24 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 10](#10-the-u
 | worker-service | `POST` | `/debug/fix-db` | Turn off Failure A | humans testing |
 | worker-service | `POST` | `/debug/spike-cost` | Turn on Failure B | humans testing, future UI "Spike Cost" button |
 | worker-service | `POST` | `/debug/fix-cost` | Turn off Failure B | humans testing |
-| watcher-service | `POST` | `/alerts/webhook` | Receive a SigNoz alert | humans testing today; **SigNoz itself once alert rules exist** |
+| watcher-service | `POST` | `/alerts/webhook` | Receive a SigNoz alert | **SigNoz itself**, confirmed firing automatically for `db-error-rate-alert`; humans testing for the not-yet-created cost-spike rule |
 | watcher-service | `GET` | `/watcher/status` | Liveness probe | humans testing, docker-compose, future UI |
 
 ---
 
 ## 6. The AI / agent layer, in full
 
-**Where the AI actually is right now: nowhere.** `diagnose.js` is a deterministic `if/else` stub, and it doesn't even branch yet. This is a real gap, not a hidden design choice, be upfront about it. The reasoning documented in the code for using `if/else` instead of an LLM for the 2 core failures is deliberate: a live demo cannot afford an LLM saying something unpredictable on stage. That reasoning is sound *for the 2 known failures specifically*, but it means today there is no AI/LLM call anywhere in this codebase.
+**Where the AI actually is right now: nowhere.** `diagnose.js` is a deterministic `if/else`, fully wired but still not an LLM. This is a deliberate, documented choice, not a hidden gap: a live demo cannot afford an LLM saying something unpredictable on stage. That reasoning is sound *for the 2 known failures specifically*, but it means there is still no AI/LLM call anywhere in this codebase, see UC7 below for exactly where one would fit without risking the reliable path.
 
 ### Every agent use case the design supports
 
 | Use case | What triggers it | What the agent should decide | Exact API call it makes to fix it | Status |
 |---|---|---|---|---|
-| UC1: Recognize Failure A (DB outage) | Alert rule name contains `db-error-rate` | Turn on `use_backup_data` | `PUT control-plane:4001/settings {key:"use_backup_data", value:true, updated_by:"watcher"}` | Not wired |
-| UC2: Recognize Failure B (cost spike) | Alert rule name contains `cost-spike` | Switch `active_model` to the cheap option | `PUT control-plane:4001/settings {key:"active_model", value:"gpt-cheap", updated_by:"watcher"}` | Not wired |
-| UC3: Block an unsafe fix | A chosen fix would be `retry_enabled=false` while `use_backup_data=true` | Refuse to apply it | No `PUT` call made; incident logged with `safety_check_result:"blocked"` | Not wired |
-| UC4: Log every action taken | After every alert, fixed or blocked | Always write one row | `POST control-plane:4001/incidents {...}` | Not wired |
-| UC5: Unrecognized alert | Alert rule name matches neither known failure | Do nothing dangerous, log it as unrecognized | `POST /incidents` with `action_taken:"none"`, no `PUT /settings` call | Not designed yet, should be added alongside UC1/UC2 as the `else` branch |
+| UC1: Recognize Failure A (DB outage) | Alert rule name contains `db-error-rate` | Turn on `use_backup_data` | `PUT control-plane:4001/settings {key:"use_backup_data", value:true, updated_by:"watcher"}` | **Wired and verified.** A simulated real-shaped webhook flipped the setting automatically. |
+| UC2: Recognize Failure B (cost spike) | Alert rule name contains `cost-spike` | Switch `active_model` to the cheap option | `PUT control-plane:4001/settings {key:"active_model", value:"gpt-cheap", updated_by:"watcher"}` | **Wired and verified** the same way. The 2nd real SigNoz alert rule for this still needs creating (Section 11, step 2). |
+| UC3: Block an unsafe fix | A chosen fix would be `retry_enabled=false` while `use_backup_data=true` | Refuse to apply it | No `PUT` call made; incident logged with `safety_check_result:"blocked"` | **Wired**, verified by calling `checkSafety()` directly with the blocking input. Neither UC1 nor UC2's diagnosis ever proposes this action, so it can't be exercised by a real alert today, it's a boundary that's ready if a 3rd failure mode is added. |
+| UC4: Log every action taken | After every alert, fixed or blocked | Always write one row | `POST control-plane:4001/incidents {...}` | **Wired and verified**, including for the unrecognized-alert case. |
+| UC5: Unrecognized alert | Alert rule name matches neither known failure | Do nothing dangerous, log it as unrecognized | `POST /incidents` with `action_taken:"none"`, no `PUT /settings` call | **Wired and verified**: settings stayed unchanged, incident logged with `diagnosis:"unrecognized alert: ..."`. |
 | UC6 (stretch): Confirm diagnosis against real telemetry | Before deciding a fix, ask SigNoz what it's actually seeing | Use SigNoz's query API/MCP server to corroborate the alert before acting | `signozClient.getRecentErrorLogs(...)` | Stub |
 | UC7 (proposed): AI-narrated incident report | After a fix is decided (deterministically) | Generate the human-readable `diagnosis` sentence for the incident log via an LLM call | New: `llmClient.narrate(alert, action)` | Not built, see below |
 
@@ -347,14 +350,14 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 
 ## 11. Exact steps to close the gap
 
-1. **Capture a real SigNoz alert payload.** Create one throwaway alert rule in the SigNoz UI, point it at watcher-service's webhook (or webhook.site first), force it to fire, copy the exact JSON into `CONTRACTS.md` Section 2. Confirms the real field name for the alert's rule identifier.
-2. **Create the 2 real SigNoz alert rules**: worker-service error rate (Failure A), `estimated_cost_usd` rate of change (Failure B). Point both at watcher-service's webhook. The span attributes these rules need (FR-WK-08) are already in place.
-3. **Wire `diagnose.js`**: branch on the real rule name from step 1, add the `else` branch for UC5 (unrecognized alert, do nothing dangerous, log it anyway).
-4. **Wire `safetyCheck.js`**: the one hardcoded UC3 rule (block `retry_enabled=false` while `use_backup_data=true`).
-5. **Uncomment steps 2-4 in `remediation.service.js`**, connecting the already-working `controlPlaneClient.js` functions.
+1. **Capture a real SigNoz alert payload.** Done on 2026-07-25: created a Metric-Based Alert (`db-error-rate-alert`) on `signoz_calls_total` filtered by `service.name='worker-service' AND status.code='STATUS_CODE_ERROR'`, a webhook channel pointed at `http://watcher-service:4002/alerts/webhook`, drove real ticket traffic through a broken DB until SigNoz fired the rule **automatically**, and captured the real payload into `CONTRACTS.md` Section 2. Rule-name field confirmed: `alerts[0].labels.alertname`.
+2. **Create the 2nd real SigNoz alert rule**: `estimated_cost_usd` rate of change (Failure B), same pattern as Failure A above. Point it at the same `watcher-service` webhook channel (already exists, reusable).
+3. **Wire `diagnose.js`.** Done on 2026-07-25: branches on `alerts[0].labels.alertname` for `db-error-rate` (-> `use_backup_data=true`) and `cost-spike` (-> `active_model=gpt-cheap`), plus an explicit unrecognized-alert branch that takes no action but still logs what it saw.
+4. **Wire `safetyCheck.js`.** Done: blocks `retry_enabled=false` while `use_backup_data=true`; verified directly by calling the function with both the blocking and non-blocking input combinations.
+5. **Uncomment steps 2-4 in `remediation.service.js`.** Done: `getSettings()` -> `checkSafety()` -> `applySetting()` (only if allowed and an action exists) -> `reportIncident()` (always). Verified live: a simulated `db-error-rate-alert` webhook flipped `use_backup_data` to `true` and wrote a real incident row automatically, no human touching control-plane; same for a `cost-spike-alert` flipping `active_model`; an unrecognized alert correctly changed nothing but still logged an incident with `action_taken:"none"`.
 6. **(Recommended) Build option A from Section 6**: the LLM-narrated incident text, this is the smallest real "AI" addition with the least demo risk.
 7. **Build the UI** (Section 10).
-8. **Rehearse Section 8's flow end to end**, timing it, with zero manual curl commands after the one failure-trigger click.
+8. **Rehearse Section 8's flow end to end**, timing it, with zero manual curl commands after the one failure-trigger click. (Steps 1-5 above were tested with simulated webhook payloads matching the real captured shape, not yet the fully live SigNoz-fired path end to end for a fresh outage, that's the remaining rehearsal.)
 
 ---
 
@@ -364,7 +367,7 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 |---|:---:|:---:|:---:|:---:|
 | control-plane | Yes | n/a (it *is* the store) | Yes | Yes, all 3 services' traces reach SigNoz |
 | worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels done (FR-WK-08) |
-| watcher-service | Yes (skeleton) | Client code exists, unused | Yes | No, diagnose/safety-check/apply/report are stubs |
+| watcher-service | Yes | Yes, all 4 client functions actually called | Yes | Yes for both known failures + unrecognized-alert case; only the 2nd SigNoz alert rule (cost-spike) is still missing |
 | Real AI/LLM usage | No | | | See Section 6 |
 | UI | No | | | See Section 10 |
 
@@ -374,13 +377,13 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 - [x] watcher-service skeleton built, receives webhooks, responds correctly
 - [x] All 4 containers build and run together via `docker compose up`
 - [x] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
-- [ ] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
-- [ ] 2 real SigNoz alert rules created and firing
-- [ ] `diagnose.js` and `safetyCheck.js` wired for real, including the unrecognized-alert case
-- [ ] `remediation.service.js` steps 2-4 uncommented and working
+- [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
+- [x] 1st real SigNoz alert rule (`db-error-rate-alert`) created and confirmed firing automatically end to end into watcher-service; 2nd (cost-spike) still needed
+- [x] `diagnose.js` and `safetyCheck.js` wired for real, including the unrecognized-alert case
+- [x] `remediation.service.js` steps 2-4 uncommented and working, verified with simulated real-shaped webhook payloads for both failures plus an unrecognized alert
 - [ ] At least one real AI/LLM call somewhere in the loop (Section 6, option A minimum)
 - [ ] React/Next.js UI built with the 5 panels in Section 10
-- [ ] Full loop demoed with zero manual curls after the initial failure trigger (Section 8)
+- [ ] Full loop demoed with zero manual curls after the initial failure trigger, including a real SigNoz-fired cost-spike alert (Section 8)
 
 ---
 

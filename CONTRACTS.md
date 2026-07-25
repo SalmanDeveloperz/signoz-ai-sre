@@ -103,14 +103,63 @@ Response (bad key): 400 { "error": "unknown key" }
 ```
 POST /alerts/webhook   (this is the URL on watcher-service that SigNoz will call)
 
-Real payload, copied from a manual test on [DATE]:
-[PASTE THE REAL JSON HERE ONCE YOU HAVE TESTED IT]
+Real payload, copied from an actual db-error-rate-alert firing on 2026-07-25,
+triggered by breaking worker-service's fake DB and sending real ticket
+traffic until SigNoz's Metric-Based Alert rule crossed its threshold
+automatically (no manual webhook test, this is the genuine alert firing):
+
+{
+  "receiver": "watcher-service",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "db-error-rate-alert",
+        "ruleId": "019f98ae-fd65-7045-900b-449c89fe739b",
+        "ruleSource": "http://localhost:8080/alerts/overview?ruleId=019f98ae-fd65-7045-900b-449c89fe739b",
+        "severity": "critical",
+        "threshold.name": "critical"
+      },
+      "annotations": {
+        "description": "This alert is fired when the defined metric (current value: 0.13333333333333333) crosses the threshold (0)",
+        "summary": "This alert is fired when the defined metric (current value: 0.13333333333333333) crosses the threshold (0)"
+      },
+      "startsAt": "2026-07-25T09:53:15.569266647Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://localhost:8080/alerts/overview?ruleId=019f98ae-fd65-7045-900b-449c89fe739b",
+      "fingerprint": "5d66886b4ee5bbd6"
+    }
+  ],
+  "groupLabels": { "ruleId": "019f98ae-fd65-7045-900b-449c89fe739b" },
+  "commonLabels": {
+    "alertname": "db-error-rate-alert",
+    "ruleId": "019f98ae-fd65-7045-900b-449c89fe739b",
+    "ruleSource": "http://localhost:8080/alerts/overview?ruleId=019f98ae-fd65-7045-900b-449c89fe739b",
+    "severity": "critical",
+    "threshold.name": "critical"
+  },
+  "commonAnnotations": {
+    "description": "This alert is fired when the defined metric (current value: 0.13333333333333333) crosses the threshold (0)",
+    "summary": "This alert is fired when the defined metric (current value: 0.13333333333333333) crosses the threshold (0)"
+  },
+  "externalURL": "http://localhost:8080",
+  "version": "4",
+  "groupKey": "{__receiver__=\"watcher-service\"}:{ruleId=\"019f98ae-fd65-7045-900b-449c89fe739b\"}",
+  "truncatedAlerts": 0
+}
 ```
+
+This is SigNoz's standard Alertmanager-compatible webhook envelope: a top-level
+`alerts` array (usually 1 item unless grouped), each with its own `labels`
+and `annotations`, plus `commonLabels`/`commonAnnotations` mirroring the same
+fields when there's only one alert. `diagnose.js` should read the rule name
+from `alerts[0].labels.alertname` (or equivalently `commonLabels.alertname`).
 
 **The one field everyone must agree on afterward:** somewhere in that real payload will be a field that names the alert rule (commonly something like `ruleName` or `alertName`). Its purpose is critical: it's the only way `diagnose.js` tells your two demo failures apart, since both alerts arrive at the same URL. Write its exact name here once you've found it:
 
 ```
-Alert rule name field = [FILL IN ONCE YOU HAVE THE REAL PAYLOAD]
+Alert rule name field = alerts[0].labels.alertname  (also mirrored at commonLabels.alertname)
 ```
 
 **Why this matters more than it looks:** without this field name pinned down correctly, watcher-service's `diagnose.js` cannot distinguish "the database is down" from "the cost spiked," and will either guess wrong or do nothing at all.
