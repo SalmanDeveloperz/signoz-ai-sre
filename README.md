@@ -75,7 +75,7 @@ Plain-English requirements, written so a non-technical reviewer can check them o
 | FR-WK-05 | Report a simulated per-ticket cost that rises when a cost-spike condition is active and the expensive model is still selected. | Done |
 | FR-WK-06 | Provide on-demand controls to turn both failure conditions on and off, for reliable demo triggering. | Done |
 | FR-WK-07 | Emit OpenTelemetry traces for every request, tagged with the service name, so SigNoz can see error rates. | Done |
-| FR-WK-08 | Tag each trace with the specific business labels `CONTRACTS.md` Section 3 defines (`ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd`) so watcher-service and dashboards can search for them. | **Not done.** Traces exist (default HTTP/Express attributes only), but none of the custom labels are being written anywhere in the code yet. This silently blocks any future SigNoz-based diagnosis (UC6) and any dashboard built around these labels. |
+| FR-WK-08 | Tag each trace with the specific business labels `CONTRACTS.md` Section 3 defines (`ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd`) so watcher-service and dashboards can search for them. | **Done.** `POST /tickets` now sets all 4 attributes on the active span via `@opentelemetry/api`'s `trace.getActiveSpan()`. |
 
 ### watcher-service (the agent)
 
@@ -295,7 +295,7 @@ Repeat with "Spike Cost" for Failure B. Optionally add a UC3 beat: trigger a sce
    +------------------------------------+       +--------------------------+
    |           worker-service            |------>|          SigNoz          |
    |  tags traces with CONTRACTS.md      |traces |  2 real alert rules:     |
-   |  Section 3 labels (FR-WK-08)        |       |  db-error-rate, cost-spike|
+   |  Section 3 labels (done)            |       |  db-error-rate, cost-spike|
    +--------------------------------------+       +------------+-------------+
                        ^                                        |
                        | GET /settings (every ticket)            | webhook, automatic
@@ -308,7 +308,7 @@ Repeat with "Spike Cost" for Failure B. Optionally add a UC3 beat: trigger a sce
                                                  +--------------------------+
 ```
 
-New pieces vs. today: 2 real SigNoz alert rules, `diagnose.js`/`safetyCheck.js` wired for real, `remediation.service.js` fully connected, `llmClient.js` (new file), custom span attributes in worker-service (new code, FR-WK-08), and the React/Next.js dashboard (new app, Section 10).
+New pieces vs. today: 2 real SigNoz alert rules, `diagnose.js`/`safetyCheck.js` wired for real, `remediation.service.js` fully connected, `llmClient.js` (new file), and the React/Next.js dashboard (new app, Section 10). Custom span attributes in worker-service (FR-WK-08) are already done.
 
 ---
 
@@ -348,14 +348,13 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 ## 11. Exact steps to close the gap
 
 1. **Capture a real SigNoz alert payload.** Create one throwaway alert rule in the SigNoz UI, point it at watcher-service's webhook (or webhook.site first), force it to fire, copy the exact JSON into `CONTRACTS.md` Section 2. Confirms the real field name for the alert's rule identifier.
-2. **Create the 2 real SigNoz alert rules**: worker-service error rate (Failure A), `estimated_cost_usd` rate of change (Failure B). Point both at watcher-service's webhook.
-3. **Add the missing span attributes to worker-service** (FR-WK-08): tag each request's trace with `ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd` per `CONTRACTS.md` Section 3. Needed before any SigNoz-based diagnosis (UC6) or dashboard can work.
-4. **Wire `diagnose.js`**: branch on the real rule name from step 1, add the `else` branch for UC5 (unrecognized alert, do nothing dangerous, log it anyway).
-5. **Wire `safetyCheck.js`**: the one hardcoded UC3 rule (block `retry_enabled=false` while `use_backup_data=true`).
-6. **Uncomment steps 2-4 in `remediation.service.js`**, connecting the already-working `controlPlaneClient.js` functions.
-7. **(Recommended) Build option A from Section 6**: the LLM-narrated incident text, this is the smallest real "AI" addition with the least demo risk.
-8. **Build the UI** (Section 10).
-9. **Rehearse Section 8's flow end to end**, timing it, with zero manual curl commands after the one failure-trigger click.
+2. **Create the 2 real SigNoz alert rules**: worker-service error rate (Failure A), `estimated_cost_usd` rate of change (Failure B). Point both at watcher-service's webhook. The span attributes these rules need (FR-WK-08) are already in place.
+3. **Wire `diagnose.js`**: branch on the real rule name from step 1, add the `else` branch for UC5 (unrecognized alert, do nothing dangerous, log it anyway).
+4. **Wire `safetyCheck.js`**: the one hardcoded UC3 rule (block `retry_enabled=false` while `use_backup_data=true`).
+5. **Uncomment steps 2-4 in `remediation.service.js`**, connecting the already-working `controlPlaneClient.js` functions.
+6. **(Recommended) Build option A from Section 6**: the LLM-narrated incident text, this is the smallest real "AI" addition with the least demo risk.
+7. **Build the UI** (Section 10).
+8. **Rehearse Section 8's flow end to end**, timing it, with zero manual curl commands after the one failure-trigger click.
 
 ---
 
@@ -364,7 +363,7 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 | Service | Built | Talks to control-plane | Runs in docker-compose | Real SigNoz-driven behavior |
 |---|:---:|:---:|:---:|:---:|
 | control-plane | Yes | n/a (it *is* the store) | Yes | Yes, all 3 services' traces reach SigNoz |
-| worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels missing (FR-WK-08) |
+| worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels done (FR-WK-08) |
 | watcher-service | Yes (skeleton) | Client code exists, unused | Yes | No, diagnose/safety-check/apply/report are stubs |
 | Real AI/LLM usage | No | | | See Section 6 |
 | UI | No | | | See Section 10 |
@@ -374,8 +373,8 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 - [x] worker-service built, tested, reads live settings from control-plane
 - [x] watcher-service skeleton built, receives webhooks, responds correctly
 - [x] All 4 containers build and run together via `docker compose up`
+- [x] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
 - [ ] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
-- [ ] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
 - [ ] 2 real SigNoz alert rules created and firing
 - [ ] `diagnose.js` and `safetyCheck.js` wired for real, including the unrecognized-alert case
 - [ ] `remediation.service.js` steps 2-4 uncommented and working
