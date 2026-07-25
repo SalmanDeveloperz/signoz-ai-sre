@@ -103,8 +103,9 @@ Plain-English requirements, written so a non-technical reviewer can check them o
                        v
    +------------------------------------+
    |               SigNoz                |  observability platform, port 8080
-   |  1 real alert rule live:            |
+   |  2 real alert rules live:           |
    |  db-error-rate-alert (Failure A)    |
+   |  cost-spike-alert (Failure B)       |
    +--------------------------------------+
                        |
               webhook fires automatically
@@ -211,7 +212,7 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 10](#10-the-u
 | Use case | What triggers it | What the agent should decide | Exact API call it makes to fix it | Status |
 |---|---|---|---|---|
 | UC1: Recognize Failure A (DB outage) | Alert rule name contains `db-error-rate` | Turn on `use_backup_data` | `PUT control-plane:4001/settings {key:"use_backup_data", value:true, updated_by:"watcher"}` | **Wired and verified.** A simulated real-shaped webhook flipped the setting automatically. |
-| UC2: Recognize Failure B (cost spike) | Alert rule name contains `cost-spike` | Switch `active_model` to the cheap option | `PUT control-plane:4001/settings {key:"active_model", value:"gpt-cheap", updated_by:"watcher"}` | **Wired and verified** the same way. The 2nd real SigNoz alert rule for this still needs creating (Section 11, step 2). |
+| UC2: Recognize Failure B (cost spike) | Alert rule name contains `cost-spike` | Switch `active_model` to the cheap option | `PUT control-plane:4001/settings {key:"active_model", value:"gpt-cheap", updated_by:"watcher"}` | **Wired and verified end to end with a real SigNoz-fired alert.** `cost-spike-alert` (Trace-based, `avg(estimated_cost_usd)` on `service.name='worker-service'`, threshold `0.5`) fired automatically after sustained ticket traffic through a spiked-cost worker-service, and `active_model` flipped to `gpt-cheap` with no human involved. |
 | UC3: Block an unsafe fix | A chosen fix would be `retry_enabled=false` while `use_backup_data=true` | Refuse to apply it | No `PUT` call made; incident logged with `safety_check_result:"blocked"` | **Wired**, verified by calling `checkSafety()` directly with the blocking input. Neither UC1 nor UC2's diagnosis ever proposes this action, so it can't be exercised by a real alert today, it's a boundary that's ready if a 3rd failure mode is added. |
 | UC4: Log every action taken | After every alert, fixed or blocked | Always write one row | `POST control-plane:4001/incidents {...}` | **Wired and verified**, including for the unrecognized-alert case. |
 | UC5: Unrecognized alert | Alert rule name matches neither known failure | Do nothing dangerous, log it as unrecognized | `POST /incidents` with `action_taken:"none"`, no `PUT /settings` call | **Wired and verified**: settings stayed unchanged, incident logged with `diagnosis:"unrecognized alert: ..."`. |
@@ -351,10 +352,10 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 ## 11. Exact steps to close the gap
 
 1. **Capture a real SigNoz alert payload.** Done on 2026-07-25: created a Metric-Based Alert (`db-error-rate-alert`) on `signoz_calls_total` filtered by `service.name='worker-service' AND status.code='STATUS_CODE_ERROR'`, a webhook channel pointed at `http://watcher-service:4002/alerts/webhook`, drove real ticket traffic through a broken DB until SigNoz fired the rule **automatically**, and captured the real payload into `CONTRACTS.md` Section 2. Rule-name field confirmed: `alerts[0].labels.alertname`.
-2. **Create the 2nd real SigNoz alert rule**: `estimated_cost_usd` rate of change (Failure B), same pattern as Failure A above. Point it at the same `watcher-service` webhook channel (already exists, reusable).
+2. **Create the 2nd real SigNoz alert rule.** Done on 2026-07-25: since `estimated_cost_usd` is only a span attribute (not an exported metric, see FR-WK-08), this one is a **Trace-based Alert** instead of Metric-based, `avg(estimated_cost_usd)` filtered `service.name='worker-service'`, threshold `0.5` (normal cost 0.02, spiked 0.85), reusing the existing `watcher-service` webhook channel. Fired automatically after sustained traffic through `/debug/spike-cost`.
 3. **Wire `diagnose.js`.** Done on 2026-07-25: branches on `alerts[0].labels.alertname` for `db-error-rate` (-> `use_backup_data=true`) and `cost-spike` (-> `active_model=gpt-cheap`), plus an explicit unrecognized-alert branch that takes no action but still logs what it saw.
 4. **Wire `safetyCheck.js`.** Done: blocks `retry_enabled=false` while `use_backup_data=true`; verified directly by calling the function with both the blocking and non-blocking input combinations.
-5. **Uncomment steps 2-4 in `remediation.service.js`.** Done: `getSettings()` -> `checkSafety()` -> `applySetting()` (only if allowed and an action exists) -> `reportIncident()` (always). Verified live: a simulated `db-error-rate-alert` webhook flipped `use_backup_data` to `true` and wrote a real incident row automatically, no human touching control-plane; same for a `cost-spike-alert` flipping `active_model`; an unrecognized alert correctly changed nothing but still logged an incident with `action_taken:"none"`.
+5. **Uncomment steps 2-4 in `remediation.service.js`.** Done: `getSettings()` -> `checkSafety()` -> `applySetting()` (only if allowed and an action exists) -> `reportIncident()` (always). Verified live with both **real, SigNoz-fired** alerts (not just simulated payloads): `db-error-rate-alert` flipped `use_backup_data` to `true`, `cost-spike-alert` flipped `active_model` to `gpt-cheap`, both with a real incident row written automatically and no human touching control-plane; a simulated unrecognized alert correctly changed nothing but still logged an incident with `action_taken:"none"`.
 6. **(Recommended) Build option A from Section 6**: the LLM-narrated incident text, this is the smallest real "AI" addition with the least demo risk.
 7. **Build the UI** (Section 10).
 8. **Rehearse Section 8's flow end to end**, timing it, with zero manual curl commands after the one failure-trigger click. (Steps 1-5 above were tested with simulated webhook payloads matching the real captured shape, not yet the fully live SigNoz-fired path end to end for a fresh outage, that's the remaining rehearsal.)
@@ -367,7 +368,7 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 |---|:---:|:---:|:---:|:---:|
 | control-plane | Yes | n/a (it *is* the store) | Yes | Yes, all 3 services' traces reach SigNoz |
 | worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels done (FR-WK-08) |
-| watcher-service | Yes | Yes, all 4 client functions actually called | Yes | Yes for both known failures + unrecognized-alert case; only the 2nd SigNoz alert rule (cost-spike) is still missing |
+| watcher-service | Yes | Yes, all 4 client functions actually called | Yes | Yes, both known failures verified end to end with real SigNoz-fired alerts, plus the unrecognized-alert case |
 | Real AI/LLM usage | No | | | See Section 6 |
 | UI | No | | | See Section 10 |
 
@@ -378,12 +379,12 @@ This is not built yet. Nothing in the repo currently serves a browser page.
 - [x] All 4 containers build and run together via `docker compose up`
 - [x] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
 - [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
-- [x] 1st real SigNoz alert rule (`db-error-rate-alert`) created and confirmed firing automatically end to end into watcher-service; 2nd (cost-spike) still needed
+- [x] Both real SigNoz alert rules (`db-error-rate-alert` Metric-based, `cost-spike-alert` Trace-based) created and confirmed firing automatically end to end into watcher-service
 - [x] `diagnose.js` and `safetyCheck.js` wired for real, including the unrecognized-alert case
 - [x] `remediation.service.js` steps 2-4 uncommented and working, verified with simulated real-shaped webhook payloads for both failures plus an unrecognized alert
 - [ ] At least one real AI/LLM call somewhere in the loop (Section 6, option A minimum)
 - [ ] React/Next.js UI built with the 5 panels in Section 10
-- [ ] Full loop demoed with zero manual curls after the initial failure trigger, including a real SigNoz-fired cost-spike alert (Section 8)
+- [x] Full loop demoed with zero manual curls after the initial failure trigger, for both failures, with real SigNoz-fired alerts (Section 8)
 
 ---
 
