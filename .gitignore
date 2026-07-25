@@ -7,5 +7,5 @@ node_modules/
 npm-debug.log*
 
 # Env files (never commit real secrets/config)
-.env
 *.local.env
+config.bat
