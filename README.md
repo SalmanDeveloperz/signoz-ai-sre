@@ -2,7 +2,7 @@
 
 A self-healing infrastructure system, fully instrumented with OpenTelemetry and observed through SigNoz. One service does real work and can be told to fail on command (`worker-service`). A second service watches it entirely through SigNoz's own alerts and telemetry, never by talking to it directly (`watcher-service`), and fixes it automatically. Known failure patterns are fixed instantly by deterministic rules (Tier 1). Failures nobody anticipated are investigated by an LLM that uses SigNoz's own Query API as its tools (Tier 2), and that investigation is itself traced in SigNoz, so the agent's own reasoning is as observable as the infrastructure it watches. A third service (`control-plane`) holds the shared settings the other two read and write, plus a permanent audit log of every automated action.
 
-Full data contracts: [`CONTRACTS.md`](CONTRACTS.md). Agent/AI coding rules: [`AGENTS.md`](AGENTS.md).
+Full data contracts: [`CONTRACTS.md`](CONTRACTS.md). Agent/AI coding rules: [`AGENTS.md`](AGENTS.md). Setting up the project from scratch, exact commands, SigNoz alerts, SigNoz dashboard: [`SETUP.md`](SETUP.md).
 
 ## Table of contents
 
@@ -70,57 +70,35 @@ Steps 1 to 5 are identical to Walkthrough B, except the alert's name matches nei
 
 ## 2. Quickstart: run it end to end
 
-### Prerequisites
-
-- Docker, with Docker Compose v2 (`docker compose`, not the old `docker-compose`).
-- A running SigNoz instance, reachable from Docker, with its OTLP collector and Query API exposed. This repo does not start SigNoz itself, `docker-compose.yml` joins an existing external Docker network that SigNoz's own containers are on.
-  - If you don't already have SigNoz running, follow SigNoz's own self-hosting guide (their official `docker-compose` install works fine) and note two things afterward: the name of the Docker network SigNoz's containers joined, and the container name/alias of its OTLP collector.
-  - **Known gotcha, found the hard way:** container hostnames are not always what you'd guess. In this project's own SigNoz install, the collector's real alias turned out to be `signoz-ingester`, and the main SigNoz container's real alias turned out to be `signoz-signoz-0`, not `signoz`. Wrong hostnames don't error, they just make telemetry or Tier 2's queries silently return nothing. Verify with `docker network inspect <your-signoz-network-name>` and update `docker-compose.yml`'s `OTEL_EXPORTER_OTLP_ENDPOINT` / `SIGNOZ_URL` values, and `watcher-service/.env.example`'s matching comments, to match what you actually find.
-
-### Step 1: configure secrets (optional, only needed for Tier 2)
-
-Create a file named `.env` in the repo root (already gitignored, never commit it):
-
-```
-SIGNOZ_API_KEY=<from SigNoz UI -> Settings -> Service Accounts, see Section 7>
-LLM_PROVIDER=gemini
-GOOGLE_API_KEY=<from https://aistudio.google.com/apikey>
-```
-
-**Why:** every other command below works with no `.env` file at all, Tier 1 has zero dependency on any of this. Without a key for the active provider, Tier 2 still runs, it just safely no-ops on an unrecognized alert instead of investigating (logs `"no automated fix, <provider> API key not configured"`). To use Anthropic or OpenAI instead, set `LLM_PROVIDER=anthropic` or `openai` and the matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, nothing else changes.
-
-### Step 2: start everything
+Full setup instructions (prerequisites, Docker or local, SigNoz alerts, SigNoz dashboard, exact commands) live in [`SETUP.md`](SETUP.md). This section assumes that's already done and walks through actually using the running system. The short version, if you just want it running:
 
 ```bash
 docker compose up -d --build
-```
-**Why `-d`:** runs the containers in the background instead of blocking your terminal. **Why `--build`:** rebuilds each service's image from its `Dockerfile` first, so any local code change actually takes effect (without it, Compose would happily reuse a stale image). **Outcome:** 4 containers created and started: `app-postgres`, `control-plane`, `watcher-service`, `worker-service`.
-
-```bash
 docker compose ps
 ```
-**Why:** confirms all 4 actually started and stayed up, rather than crash-looping silently in the background. **Outcome:** all 4 rows show `Up` (or `Up (healthy)` for `app-postgres`, which has a healthcheck).
+**Outcome:** 5 containers `Up`: `app-postgres`, `control-plane`, `watcher-service`, `worker-service`, `frontend`.
 
 | Service | Port |
 |---|---|
 | worker-service | `4000` |
 | control-plane | `4001` |
 | watcher-service | `4002` |
+| frontend | `5173` |
 | app-postgres | `5433` (host side; kept off `5432` to avoid clashing with a local Postgres install) |
 | SigNoz UI | `8080` (from your existing SigNoz install) |
 
-### Step 3: start the frontend (recommended, a clickable alternative to Steps 4-6 below)
+### Step 1: start the frontend (recommended, a clickable alternative to Steps 2-5 below)
 
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-**Why:** the frontend is a separate Vite project (not part of `docker-compose.yml`, it doesn't need a container to develop against), so it's installed and started on its own. **Outcome:** Vite prints a local URL, normally `http://localhost:5173`. Open it: you'll see a live-updating settings panel, an incident timeline with search, a ticket feed, and one-click buttons for every scenario in Steps 4 to 6. It talks to the 3 backend services through Vite's dev proxy (configured in `frontend/vite.config.ts`), so no CORS setup was needed on any Express service. Click **Guide** in the top right for the same walkthrough in-app. See [Section 8](#8-the-ui-reactnextjs) for what's in it.
+**Why run it this way instead of `docker compose up`:** this is the fastest loop while you're actively looking at the UI (instant reload on save). The exact same frontend also runs as the `frontend` service in `docker-compose.yml` if you'd rather have it start with everything else, see [`SETUP.md` Section 4](SETUP.md#4-run-everything-with-docker-recommended). **Outcome:** Vite prints a local URL, normally `http://localhost:5173`. Open it: you'll see a live-updating settings panel, an incident timeline with search, a ticket feed, and one-click buttons for every scenario in Steps 2 to 5. It talks to the 3 backend services through Vite's dev proxy (configured in `frontend/vite.config.ts`), so no CORS setup was needed on any Express service. Click **Guide** in the top right for the same walkthrough in-app. See [Section 8](#8-the-ui-reactnextjs) for what's in it.
 
-The rest of this Quickstart uses curl/PowerShell directly against the APIs, useful for scripting or verifying a specific call, everything in Steps 4 to 6 maps 1:1 to a button in the frontend if you'd rather click than type.
+The rest of this Quickstart uses curl/PowerShell directly against the APIs, useful for scripting or verifying a specific call, everything in Steps 2 to 5 maps 1:1 to a button in the frontend if you'd rather click than type.
 
-### Step 4: verify the happy path
+### Step 2: verify the happy path
 
 - **macOS / Linux / Windows (Git Bash):**
   ```bash
@@ -134,7 +112,7 @@ The rest of this Quickstart uses curl/PowerShell directly against the APIs, usef
   ```
 **Why:** the first call proves control-plane is up and serving its 3 default settings. The second proves worker-service can reach control-plane and handle a ticket (Walkthrough A above). **Outcome:** the first returns `{"use_backup_data":false,"active_model":"gpt-standard","retry_enabled":true}`; the second returns a `ticket_id`, a fake `customer`, the active `model`, and a small `estimated_cost_usd`.
 
-### Step 5: trigger Failure A (`db-error-rate`) and watch it self-heal
+### Step 3: trigger Failure A (`db-error-rate`) and watch it self-heal
 
 ```bash
 curl -s -X POST http://localhost:4000/debug/break-db
@@ -162,11 +140,11 @@ curl -s -X POST http://localhost:4000/debug/fix-db
 curl -s -X PUT http://localhost:4001/settings -H "Content-Type: application/json" -d '{"key":"use_backup_data","value":false,"updated_by":"reset"}'
 ```
 
-### Step 6: trigger Failure B (`cost-spike`) the same way
+### Step 4: trigger Failure B (`cost-spike`) the same way
 
-Repeat Step 5 with `/debug/spike-cost` and `/debug/fix-cost` instead. **Outcome:** `active_model` flips to `gpt-cheap` instead of `use_backup_data` flipping, everything else about the flow is identical.
+Repeat Step 3 with `/debug/spike-cost` and `/debug/fix-cost` instead. **Outcome:** `active_model` flips to `gpt-cheap` instead of `use_backup_data` flipping, everything else about the flow is identical.
 
-### Step 7: trigger Tier 2 (an alert nobody wrote a rule for)
+### Step 5: trigger Tier 2 (an alert nobody wrote a rule for)
 
 There's no real SigNoz alert rule for an "unrecognized" failure by definition, so this is demoed by posting directly to the same webhook SigNoz would call, with a name Tier 1 doesn't recognize:
 
@@ -185,32 +163,20 @@ docker compose logs watcher-service --tail 20
 ```
 Without a provider key configured: `"no automated fix, gemini API key not configured"` (or whichever provider), settings untouched, an incident still logged. With one configured: a real model-generated diagnosis, e.g. *"the worker-service is experiencing high latency, but there are no recent error spans or traces to indicate the cause"*, meaning the model actually called its SigNoz tools, found no evidence, and correctly proposed no action rather than guessing.
 
-### Step 8: set up the SigNoz dashboard
+### Step 6: see it in the SigNoz dashboard
 
-A ready-to-import dashboard definition is committed at [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), 6 panels wired to the exact span attributes this codebase already emits (no new instrumentation needed, see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost) for what each panel shows).
+A ready-to-import dashboard definition is committed at [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), 7 panels wired to the exact span attributes this codebase already emits. Import steps (2 ways, UI or API) are in [`SETUP.md` Section 7](SETUP.md#7-set-up-the-signoz-dashboard). Panels show "No Data" for anything you haven't triggered yet, e.g. "Cost per ticket" needs Step 4's traffic first.
 
-1. Copy the file's contents to your clipboard:
-   - **macOS:** `cat signoz/dashboard-ai-sre-observability.json | pbcopy`
-   - **Linux (with `xclip` installed):** `cat signoz/dashboard-ai-sre-observability.json | xclip -selection clipboard` (otherwise just open the file and copy its full contents manually)
-   - **Windows (PowerShell):** `Get-Content signoz\dashboard-ai-sre-observability.json -Raw | Set-Clipboard`
-2. Open SigNoz at `http://localhost:8080/dashboard` -> **New dashboard** -> **Import JSON**.
-3. Paste into the editor, click **Import and Next**, then confirm on the next screen.
-**Outcome:** a dashboard named "AI SRE: Self-Healing Infra Observability" appears with all 6 panels already querying real data, no manual panel-building required. Panels will show "No Data" for anything you haven't triggered yet (e.g. "Cost per ticket" needs Step 6's traffic first).
-
-### Step 9: watch it in SigNoz's own UI
+### Step 7: watch it in SigNoz's own UI
 
 Open `http://localhost:8080`. **Services** tab: all 3 app services listed once they've each handled at least one request. **Alerts** tab: both rules and their firing history. **Traces** tab: search `investigate.tier2` to see Tier 2's own reasoning as a trace, with its `gen_ai.*` attributes.
 
-### Step 10: stop everything
+### Step 8: stop everything
 
 ```bash
 docker compose down
 ```
-**Why:** stops and removes the 4 containers. **Outcome:** the named Postgres volume (`app-postgres-data`) is preserved, so settings and incident history survive the next `docker compose up`. Add `-v` only if you want a fully clean slate (this deletes that volume).
-
-### Troubleshooting: containers exit right after starting
-
-If every container exits with code `255` immediately after `docker compose up`, and manually restarting your SigNoz containers gives an error like `mount ... not a directory`, this is a known Docker Desktop/WSL2 issue: after the WSL2 VM restarts (sleep/wake, resource-saver idling out, a host reboot), its bind-mount table can get out of sync with the host filesystem. Fix: fully restart Docker Desktop (or on Windows, `wsl --shutdown` then relaunch Docker Desktop), start your SigNoz containers again, then re-run `docker compose up -d --build` for this repo. Nothing in this repo's own code causes this, it's one layer down, in Docker itself.
+**Outcome:** stops and removes all 5 containers. The named Postgres volume (`app-postgres-data`) is preserved, so settings and incident history survive the next `docker compose up`. Add `-v` only if you want a fully clean slate (this deletes that volume).
 
 ---
 
@@ -231,7 +197,7 @@ If every container exits with code `255` immediately after `docker compose up`, 
 - [x] control-plane built, tested, layered (routes -> controllers -> services -> repositories), documented
 - [x] worker-service built, tested, reads live settings from control-plane on every ticket
 - [x] watcher-service Tier 1 built, tested, both known failures verified live with real SigNoz-fired alerts
-- [x] All 4 containers build and run together via `docker compose up`
+- [x] All 5 containers (including the frontend) build and run together via `docker compose up`
 - [x] worker-service tags traces with the business labels `CONTRACTS.md` Section 3 defines (`ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd`)
 - [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
 - [x] Both real SigNoz alert rules created and confirmed firing automatically end to end
@@ -477,7 +443,7 @@ Override the model for any provider with `LLM_MODEL`. Note: `gemini-2.0-flash` r
 
 ## 8. The UI (React/Next.js)
 
-The system works without a UI, all 3 services are pure APIs, everything in [Section 2](#2-quickstart-run-it-end-to-end) is demoable with curl or PowerShell alone. The UI exists to make it watchable instead of a terminal full of JSON. It lives in [`frontend/`](frontend), a standalone Vite project, and is started with `cd frontend && npm install && npm run dev` (Step 3 of the Quickstart).
+The system works without a UI, all 3 services are pure APIs, everything in [Section 2](#2-quickstart-run-it-end-to-end) is demoable with curl or PowerShell alone. The UI exists to make it watchable instead of a terminal full of JSON. It lives in [`frontend/`](frontend), a standalone Vite project, and is started with `cd frontend && npm install && npm run dev` (Step 1 of the Quickstart).
 
 ### Stack
 
@@ -553,16 +519,17 @@ SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordE
 
 ### 9.3 Dashboard (built, importable)
 
-[`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json) is a real dashboard definition exported from a working SigNoz instance. Import steps are in [Section 2, Step 8](#2-quickstart-run-it-end-to-end). It has 6 panels, all traces-based, all confirmed pulling real data:
+[`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json) is a real dashboard definition exported from a working SigNoz instance. Import steps (2 ways, UI or API) are in [`SETUP.md` Section 7](SETUP.md#7-set-up-the-signoz-dashboard). It has 7 panels, all traces-based, all confirmed pulling real data:
 
 | Panel | Query | What it shows |
 |---|---|---|
 | Worker error rate (Failure A) | `count()`, filter `service.name = 'worker-service' AND has_error = 'true'` | Failure A spiking and recovering |
 | Cost per ticket over time (Failure B) | `avg(estimated_cost_usd)`, filter `service.name = 'worker-service'` | Failure B's cost spike and the fix bringing it back down |
-| LLM token usage | `sum(gen_ai.usage.input_tokens)` and `sum(gen_ai.usage.output_tokens)`, filter `name = 'investigate.tier2'` | Real LLM calls happening, not faked |
+| LLM input tokens | `sum(gen_ai.usage.input_tokens)`, filter `name = 'investigate.tier2'` | Real LLM calls happening, not faked |
+| LLM output tokens | `sum(gen_ai.usage.output_tokens)`, filter `name = 'investigate.tier2'` | A separate panel on purpose: output tokens (tens) are 1-2% the size of input tokens (thousands), sharing one axis made this line look like a flat zero even though the data was real |
 | LLM investigation latency | `avg(duration_nano)`, filter `name = 'investigate.tier2'` | Tier 2's real-world response time |
 | Agent tool-call volume | `count()` split across `name = 'signoz.query_recent_traces'` / `'signoz.query_error_spans'` | How many times the agent looked at telemetry before deciding |
-| Tier 2 investigations vs total alerts received | `count()` on `name = 'investigate.tier2'` vs `name = 'POST'`, both `service.name = 'watcher-service'` | Approximates "N resolved instantly by Tier 1, M needed AI investigation"; an exact split needs the optional tier tag noted in [Section 3](#3-whats-done-whats-left) |
+| Tier 2 investigations vs total alerts received | `count()` on `name = 'investigate.tier2'` vs `name = 'POST /alerts/webhook'`, both `service.name = 'watcher-service'` | Approximates "N resolved instantly by Tier 1, M needed AI investigation"; an exact split needs the optional tier tag noted in [Section 3](#3-whats-done-whats-left). Note: the "total alerts" side must filter on the exact inbound span name, not just `name = 'POST'`, which also matches every outbound call watcher-service makes to control-plane and the LLM provider |
 
 All of these read span **attributes already being set** by the code in this repo, no new instrumentation was needed to build this dashboard, only its definition.
 
