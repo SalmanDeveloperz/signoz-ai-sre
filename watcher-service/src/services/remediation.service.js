@@ -20,7 +20,23 @@ const controlPlane = require('../clients/controlPlaneClient');
 
 const tracer = trace.getTracer('watcher-service');
 
+// SigNoz sends a second webhook call when a firing alert clears
+// ("status": "resolved"), using the exact same alertname. Without this
+// check that second call was being diagnosed and fixed all over again,
+// re-applying a fix (or re-running a whole Tier 2 investigation) for a
+// problem that's already gone. Manual test payloads that omit "status"
+// entirely (see README Section 2) are treated as firing, unchanged.
+function isFiring(alert) {
+  const status = alert?.alerts?.[0]?.status || alert?.status;
+  return status !== 'resolved';
+}
+
 async function handleAlert(alert) {
+  if (!isFiring(alert)) {
+    console.log('[watcher] alert resolved, nothing to do.');
+    return;
+  }
+
   // One span wraps the whole remediation so the watcher's reasoning is one
   // trace in SigNoz, and the control-plane calls nest under it.
   return tracer.startActiveSpan('watcher.remediation', async (span) => {
