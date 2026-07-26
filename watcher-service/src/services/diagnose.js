@@ -46,6 +46,22 @@ async function diagnose(alertPayload) {
 // at the same webhook URL. Real payload shape confirmed in CONTRACTS.md
 // Section 2 (captured from an actual db-error-rate-alert firing): the rule
 // name lives at alerts[0].labels.alertname (mirrored at commonLabels.alertname).
+// Pattern: Service Layer. Two tiers, in order:
+//
+//   Tier 1 (below, this function): a plain if/else on the alert rule name for
+//   the 2 known failure modes, on purpose, an LLM buys unpredictability where
+//   predictability is the whole point. The alert rule name is how the two
+//   alerts are told apart, since both arrive at the same webhook URL. Real
+//   payload shape confirmed in CONTRACTS.md Section 2: the rule name lives at
+//   alerts[0].labels.alertname (mirrored at commonLabels.alertname).
+//
+//   Tier 2 (services/investigate.js): only reached when Tier 1 doesn't
+//   recognize the alert. This is where an LLM actually investigates using
+//   real SigNoz telemetry as tools, instead of the system just giving up.
+//   Tier 1 always wins when it applies, keeping the 2 demoed failures fast
+//   and deterministic; Tier 2 only runs for the cases nobody anticipated.
+
+const { investigate } = require('./investigate');
 
 function getAlertName(alertPayload) {
   return (
@@ -74,6 +90,7 @@ async function diagnose(alertPayload) {
     };
   }
 
+  const investigation = await investigate(alertPayload);
   return {
     diagnosis: `unrecognized alert (${ruleName || 'no rule name'}), no action taken`,
     action: null,
@@ -81,6 +98,9 @@ async function diagnose(alertPayload) {
     diagnosis: `unrecognized alert: ${alertname || 'unknown'}`,
     action: null,
     detected_via: alertname,
+    diagnosis: investigation.diagnosis,
+    action: investigation.action,
+    detected_via: alertname || 'unknown',
   };
 }
 
