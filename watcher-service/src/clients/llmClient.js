@@ -12,8 +12,10 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
+// gemini-2.0-flash returns quota-exceeded (limit: 0) on some free-tier
+// accounts even with a fresh key; gemini-2.5-flash verified working live.
 const DEFAULT_MODELS = {
-  gemini: 'gemini-2.0-flash',
+  gemini: 'gemini-2.5-flash',
   anthropic: 'claude-sonnet-5',
   openai: 'gpt-4o-mini',
 };

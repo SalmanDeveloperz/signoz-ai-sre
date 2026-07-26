@@ -1,55 +1,241 @@
 # signoz-ai-sre
 
-An AI SRE demo, built for SigNoz's **Track 1: AI & Agent Observability**. One service does real work and can be told to fail on command. A second agent watches it through SigNoz. Known failures get fixed instantly and deterministically. Unknown failures get **actually investigated by an LLM using SigNoz's own telemetry as tools**, and that investigation is itself traced in SigNoz. Everything is mediated by one shared, auditable settings service.
+A self-healing infrastructure system, fully instrumented with OpenTelemetry and observed through SigNoz. One service does real work and can be told to fail on command (`worker-service`). A second service watches it entirely through SigNoz's own alerts and telemetry, never by talking to it directly (`watcher-service`), and fixes it automatically. Known failure patterns are fixed instantly by deterministic rules (Tier 1). Failures nobody anticipated are investigated by an LLM that uses SigNoz's own Query API as its tools (Tier 2), and that investigation is itself traced in SigNoz, so the agent's own reasoning is as observable as the infrastructure it watches. A third service (`control-plane`) holds the shared settings the other two read and write, plus a permanent audit log of every automated action.
 
 Full data contracts: [`CONTRACTS.md`](CONTRACTS.md). Agent/AI coding rules: [`AGENTS.md`](AGENTS.md).
 
 ## Table of contents
 
-1. [The problem, in plain English](#1-the-problem-in-plain-english)
-2. [What's been built so far](#2-whats-been-built-so-far)
-3. [Functional requirements, per service](#3-functional-requirements-per-service)
-4. [Current architecture](#4-current-architecture)
-5. [Ticket vocabulary + master endpoint reference](#5-ticket-vocabulary--master-endpoint-reference)
-6. [The AI / agent layer, in full](#6-the-ai--agent-layer-in-full)
-7. [Why this is a good problem to solve](#7-why-this-is-a-good-problem-to-solve)
-8. [Target architecture (what's left)](#8-target-architecture-whats-left)
-9. [The UI (React/Next.js)](#9-the-ui-reactnextjs)
-10. [SigNoz: dashboards, alerts, exceptions, LLM cost](#10-signoz-dashboards-alerts-exceptions-llm-cost)
-11. [Exact steps to close the gap](#11-exact-steps-to-close-the-gap)
-12. [Status matrix + readiness checklist](#12-status-matrix--readiness-checklist)
-13. [Run it yourself: Windows, Linux, macOS](#13-run-it-yourself-windows-linux-macos)
+1. [How it works: the full request flow](#1-how-it-works-the-full-request-flow)
+2. [Quickstart: run it end to end](#2-quickstart-run-it-end-to-end)
+3. [What's done, what's left](#3-whats-done-whats-left)
+4. [Functional requirements, per service](#4-functional-requirements-per-service)
+5. [Current architecture + file map](#5-current-architecture--file-map)
+6. [Ticket vocabulary + master endpoint reference](#6-ticket-vocabulary--master-endpoint-reference)
+7. [The AI / agent layer, in full](#7-the-ai--agent-layer-in-full)
+8. [The UI (React/Next.js), not built yet](#8-the-ui-reactnextjs-not-built-yet)
+9. [SigNoz: dashboards, alerts, exceptions, LLM cost](#9-signoz-dashboards-alerts-exceptions-llm-cost)
 
 ---
 
-## 1. The problem, in plain English
+## 1. How it works: the full request flow
 
-Software breaks in ways that fall into two buckets. **Known patterns**: you've seen this exact failure before, there's a known fix, a human just needs to notice and apply it, usually at 3am. **Novel failures**: nobody anticipated this exact shape, so there's no hardcoded rule, someone has to actually look at traces and logs, form a hypothesis, and decide. This project automates both, honestly: known patterns get instant, deterministic fixes with zero AI risk involved; novel failures get investigated by an LLM that uses SigNoz's own telemetry as tools, the same way a human SRE would, and its entire investigation is itself traced and auditable.
+This is the fastest way to understand the system: 3 concrete walkthroughs, service by service and file by file, for the 3 things that actually happen at runtime.
 
-**In one sentence: the pager doesn't fire for either bucket, an accountable agent handles both, and every action, human-anticipated or AI-investigated, leaves a paper trail proving what happened and why.**
+**The 4 actors:**
+- `worker-service` (port 4000): a stand-in production API. Handles simulated support tickets, can be told to fail on demand.
+- `control-plane` (port 4001): the only shared state. 3 settings switches, plus a permanent incident log. Postgres-backed.
+- `watcher-service` (port 4002): the agent. Never talks to worker-service directly, it only ever watches it through SigNoz, and only ever acts through control-plane.
+- SigNoz (port 8080): the observability platform all 3 services send OpenTelemetry traces to, and the thing that actually notices failures and fires alerts.
+
+### Walkthrough A: a normal request (`POST /tickets`)
+
+1. Caller sends `POST worker-service:4000/tickets` -> handled directly in [`worker-service/src/server.js`](worker-service/src/server.js).
+2. That handler calls [`controlPanelClient.js`](worker-service/src/controlPanelClient.js)'s `getSettings()` -> `GET control-plane:4001/settings`.
+3. On control-plane: [`routes/settings.routes.js`](control-plane/src/routes/settings.routes.js) -> [`controllers/settings.controller.js`](control-plane/src/controllers/settings.controller.js) -> [`services/settings.service.js`](control-plane/src/services/settings.service.js) -> [`repositories/settings.repository.js`](control-plane/src/repositories/settings.repository.js) -> Postgres, and the 3 current switches come back.
+4. Back in worker-service, the handler uses those settings (is `use_backup_data` on? is the fake DB "broken"? is cost "spiked"?) to decide the response, and tags the active span with `ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd`.
+5. [`instrumentation.js`](worker-service/src/instrumentation.js), loaded before anything else in the process, has already wired this request as an OpenTelemetry trace and exports it over OTLP to SigNoz's collector. That trace, with those 4 attributes, is now searchable inside SigNoz.
+6. Response goes back to the caller. control-plane never learns a ticket happened, it only sees that its settings were read.
+
+**Why this indirection matters:** worker-service and watcher-service never call each other. The only things connecting them are (a) control-plane's shared settings and (b) SigNoz's telemetry. That's what makes Walkthroughs B and C below possible without either service knowing the other exists.
+
+### Walkthrough B: Tier 1, a known failure self-healing with no human involved
+
+1. Someone calls `POST worker-service:4000/debug/break-db` (or `/debug/spike-cost`). This flips an in-memory flag in [`customerDb.js`](worker-service/src/customerDb.js), nothing else changes yet.
+2. Normal ticket traffic keeps hitting `POST /tickets` (Walkthrough A). Now some responses fail (`503`, `db_broken: true`) or report a high `estimated_cost_usd`. Every one of these is still a normal trace, exported to SigNoz exactly as before.
+3. SigNoz's own alert engine, continuously evaluating 2 rules against that incoming telemetry, notices the threshold crossed: `db-error-rate-alert` (error rate on `worker-service` above 0 over a rolling 5-minute window) or `cost-spike-alert` (`avg(estimated_cost_usd)` above 0.5 over a rolling 5-minute window). Nobody calls these rules. SigNoz fires them on its own.
+4. SigNoz calls its configured webhook: `POST watcher-service:4002/alerts/webhook`, with a payload shaped exactly like the real one captured in [`CONTRACTS.md`](CONTRACTS.md) Section 2.
+5. [`alerts.controller.js`](watcher-service/src/controllers/alerts.controller.js)'s `receiveAlert()` responds `200` immediately, so SigNoz's webhook call never times out or retries, then hands the payload to [`remediation.service.js`](watcher-service/src/services/remediation.service.js)'s `handleAlert()` asynchronously.
+6. `handleAlert()` calls [`diagnose.js`](watcher-service/src/services/diagnose.js)'s `diagnose()`, which reads `alerts[0].labels.alertname`, matches it against `db-error-rate` or `cost-spike`, and returns a diagnosis plus a proposed action, e.g. `{key: 'use_backup_data', value: true}`.
+7. `handleAlert()` calls [`safetyCheck.js`](watcher-service/src/services/safetyCheck.js)'s `checkSafety()` against the settings as they stand right now. For these 2 failures it's always allowed, the one hardcoded rule only blocks a specific combination involving `retry_enabled`.
+8. If allowed, `controlPlaneClient.js`'s `applySetting()` calls `PUT control-plane:4001/settings`, going through the same routes -> controllers -> services -> repositories -> Postgres path as Walkthrough A. The new value is live immediately.
+9. Unconditionally, `controlPlaneClient.js`'s `reportIncident()` calls `POST control-plane:4001/incidents`, writing a permanent row: what was detected, what was diagnosed, what was done, whether it was allowed, and when.
+10. The very next `POST /tickets` (step 2 of Walkthrough A) reads the updated setting and behaves correctly. No restart, no deploy, no human touched anything after step 1.
+
+### Walkthrough C: Tier 2, an unrecognized alert gets investigated by an LLM
+
+Steps 1 to 5 are identical to Walkthrough B, except the alert's name matches neither `db-error-rate` nor `cost-spike`.
+
+6. `diagnose.js` falls through and calls [`investigate.js`](watcher-service/src/services/investigate.js)'s `investigate(alertPayload)` instead of returning a Tier 1 result.
+7. `investigate.js` calls [`llmClient.js`](watcher-service/src/clients/llmClient.js)'s `getModel()`, which, based on the `LLM_PROVIDER` env var, returns a model handle from `@ai-sdk/google`, `@ai-sdk/anthropic`, or `@ai-sdk/openai`. `investigate.js` itself never imports a provider SDK directly, only `llmClient.js` knows which one is active.
+8. `investigate.js` calls the Vercel AI SDK's `generateText()` with that model, a system prompt, the alert payload, and exactly 2 tools: `query_recent_traces` and `query_error_spans`.
+9. If the model calls a tool, it hits [`signozClient.js`](watcher-service/src/clients/signozClient.js), which makes a real, read-only `POST` to SigNoz's own `/api/v4/query_range` API (authenticated with `SIGNOZ_API_KEY`) and returns real span rows, e.g. recent traces or error spans for `worker-service`. The model can call these up to 4 times (`MAX_STEPS`) before it must answer.
+10. The model's final answer is parsed into `{diagnosis, action}`. If `action.key` isn't one of the 3 known setting keys, it's discarded before it goes anywhere (`VALID_KEYS` allowlist).
+11. From here, steps 7 to 10 of Walkthrough B repeat exactly: the same `safetyCheck.js`, the same `controlPlaneClient.js` apply/report calls. Tier 2's output carries no special privilege over Tier 1's.
+12. Every step of this, the overall investigation and each individual tool call, is its own OpenTelemetry span (`investigate.tier2`, `signoz.query_recent_traces`, `signoz.query_error_spans`), carrying `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, and `investigate.provider`. This is what makes the agent's own reasoning process, not just the infrastructure it watches, visible as a trace inside SigNoz.
+
+**Guardrails baked into this flow, not left to the model's judgment:** a fixed 3-key action allowlist, read-only tools only, a hard 10-second timeout on the whole investigation, a safe "no action" fallback if the active provider's API key is missing or the call fails, and the same safety check plus audit log as Tier 1. Full guardrail table in [Section 7](#7-the-ai--agent-layer-in-full).
 
 ---
 
-## 2. What's been built so far
+## 2. Quickstart: run it end to end
+
+### Prerequisites
+
+- Docker, with Docker Compose v2 (`docker compose`, not the old `docker-compose`).
+- A running SigNoz instance, reachable from Docker, with its OTLP collector and Query API exposed. This repo does not start SigNoz itself, `docker-compose.yml` joins an existing external Docker network that SigNoz's own containers are on.
+  - If you don't already have SigNoz running, follow SigNoz's own self-hosting guide (their official `docker-compose` install works fine) and note two things afterward: the name of the Docker network SigNoz's containers joined, and the container name/alias of its OTLP collector.
+  - **Known gotcha, found the hard way:** container hostnames are not always what you'd guess. In this project's own SigNoz install, the collector's real alias turned out to be `signoz-ingester`, and the main SigNoz container's real alias turned out to be `signoz-signoz-0`, not `signoz`. Wrong hostnames don't error, they just make telemetry or Tier 2's queries silently return nothing. Verify with `docker network inspect <your-signoz-network-name>` and update `docker-compose.yml`'s `OTEL_EXPORTER_OTLP_ENDPOINT` / `SIGNOZ_URL` values, and `watcher-service/.env.example`'s matching comments, to match what you actually find.
+
+### Step 1: configure secrets (optional, only needed for Tier 2)
+
+Create a file named `.env` in the repo root (already gitignored, never commit it):
+
+```
+SIGNOZ_API_KEY=<from SigNoz UI -> Settings -> Service Accounts, see Section 7>
+LLM_PROVIDER=gemini
+GOOGLE_API_KEY=<from https://aistudio.google.com/apikey>
+```
+
+**Why:** every other command below works with no `.env` file at all, Tier 1 has zero dependency on any of this. Without a key for the active provider, Tier 2 still runs, it just safely no-ops on an unrecognized alert instead of investigating (logs `"no automated fix, <provider> API key not configured"`). To use Anthropic or OpenAI instead, set `LLM_PROVIDER=anthropic` or `openai` and the matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, nothing else changes.
+
+### Step 2: start everything
+
+```bash
+docker compose up -d --build
+```
+**Why `-d`:** runs the containers in the background instead of blocking your terminal. **Why `--build`:** rebuilds each service's image from its `Dockerfile` first, so any local code change actually takes effect (without it, Compose would happily reuse a stale image). **Outcome:** 4 containers created and started: `app-postgres`, `control-plane`, `watcher-service`, `worker-service`.
+
+```bash
+docker compose ps
+```
+**Why:** confirms all 4 actually started and stayed up, rather than crash-looping silently in the background. **Outcome:** all 4 rows show `Up` (or `Up (healthy)` for `app-postgres`, which has a healthcheck).
+
+| Service | Port |
+|---|---|
+| worker-service | `4000` |
+| control-plane | `4001` |
+| watcher-service | `4002` |
+| app-postgres | `5433` (host side; kept off `5432` to avoid clashing with a local Postgres install) |
+| SigNoz UI | `8080` (from your existing SigNoz install) |
+
+### Step 3: verify the happy path
+
+- **macOS / Linux / Windows (Git Bash):**
+  ```bash
+  curl -s http://localhost:4001/settings
+  curl -s -X POST http://localhost:4000/tickets -H "Content-Type: application/json" -d '{"customerId":"c1"}'
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  Invoke-RestMethod -Uri http://localhost:4001/settings
+  Invoke-RestMethod -Method Post -Uri http://localhost:4000/tickets -ContentType "application/json" -Body '{"customerId":"c1"}'
+  ```
+**Why:** the first call proves control-plane is up and serving its 3 default settings. The second proves worker-service can reach control-plane and handle a ticket (Walkthrough A above). **Outcome:** the first returns `{"use_backup_data":false,"active_model":"gpt-standard","retry_enabled":true}`; the second returns a `ticket_id`, a fake `customer`, the active `model`, and a small `estimated_cost_usd`.
+
+### Step 4: trigger Failure A (`db-error-rate`) and watch it self-heal
+
+```bash
+curl -s -X POST http://localhost:4000/debug/break-db
+```
+**Why:** flips worker-service's fake DB into a broken state (Walkthrough B, step 1). **Outcome:** `db broken`. Nothing else happens yet, SigNoz needs actual failing traffic to evaluate its alert rule against.
+
+Generate continuous traffic for a few minutes (a single ticket isn't enough data for a 5-minute rolling alert to evaluate):
+
+- **macOS / Linux:**
+  ```bash
+  while true; do curl -s -o /dev/null -X POST http://localhost:4000/tickets -H "Content-Type: application/json" -d '{"customerId":"c1"}'; sleep 1; done
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  while ($true) { Invoke-RestMethod -Method Post -Uri http://localhost:4000/tickets -ContentType "application/json" -Body '{"customerId":"c1"}' | Out-Null; Start-Sleep -Seconds 1 }
+  ```
+**Why:** every request now fails with `db_broken: true`, giving SigNoz's `db-error-rate-alert` rule a real, sustained error rate to cross its threshold on. **Outcome:** after roughly 1 to 2 minutes, stop the loop (Ctrl+C) and check:
+```bash
+curl -s http://localhost:4001/settings   # use_backup_data should now be true
+curl -s http://localhost:4001/incidents  # newest row explains what happened, with no human intervention
+```
+That's Walkthrough B happening for real. Reset for next time:
+```bash
+curl -s -X POST http://localhost:4000/debug/fix-db
+curl -s -X PUT http://localhost:4001/settings -H "Content-Type: application/json" -d '{"key":"use_backup_data","value":false,"updated_by":"reset"}'
+```
+
+### Step 5: trigger Failure B (`cost-spike`) the same way
+
+Repeat Step 4 with `/debug/spike-cost` and `/debug/fix-cost` instead. **Outcome:** `active_model` flips to `gpt-cheap` instead of `use_backup_data` flipping, everything else about the flow is identical.
+
+### Step 6: trigger Tier 2 (an alert nobody wrote a rule for)
+
+There's no real SigNoz alert rule for an "unrecognized" failure by definition, so this is demoed by posting directly to the same webhook SigNoz would call, with a name Tier 1 doesn't recognize:
+
+- **macOS / Linux / Git Bash:**
+  ```bash
+  curl -s -X POST http://localhost:4002/alerts/webhook -H "Content-Type: application/json" -d '{"alerts":[{"labels":{"alertname":"high-latency-alert"}}],"commonLabels":{"alertname":"high-latency-alert"}}'
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  $body = '{"alerts":[{"labels":{"alertname":"high-latency-alert"}}],"commonLabels":{"alertname":"high-latency-alert"}}'
+  Invoke-RestMethod -Method Post -Uri http://localhost:4002/alerts/webhook -ContentType "application/json" -Body $body
+  ```
+**Why:** `high-latency-alert` matches neither Tier 1 pattern, forcing Walkthrough C's path through `investigate.js`. **Outcome:** check the logs a few seconds later:
+```bash
+docker compose logs watcher-service --tail 20
+```
+Without a provider key configured: `"no automated fix, gemini API key not configured"` (or whichever provider), settings untouched, an incident still logged. With one configured: a real model-generated diagnosis, e.g. *"the worker-service is experiencing high latency, but there are no recent error spans or traces to indicate the cause"*, meaning the model actually called its SigNoz tools, found no evidence, and correctly proposed no action rather than guessing.
+
+### Step 7: set up the SigNoz dashboard
+
+A ready-to-import dashboard definition is committed at [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), 6 panels wired to the exact span attributes this codebase already emits (no new instrumentation needed, see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost) for what each panel shows).
+
+1. Copy the file's contents to your clipboard:
+   - **macOS:** `cat signoz/dashboard-ai-sre-observability.json | pbcopy`
+   - **Linux (with `xclip` installed):** `cat signoz/dashboard-ai-sre-observability.json | xclip -selection clipboard` (otherwise just open the file and copy its full contents manually)
+   - **Windows (PowerShell):** `Get-Content signoz\dashboard-ai-sre-observability.json -Raw | Set-Clipboard`
+2. Open SigNoz at `http://localhost:8080/dashboard` -> **New dashboard** -> **Import JSON**.
+3. Paste into the editor, click **Import and Next**, then confirm on the next screen.
+**Outcome:** a dashboard named "AI SRE: Self-Healing Infra Observability" appears with all 6 panels already querying real data, no manual panel-building required. Panels will show "No Data" for anything you haven't triggered yet (e.g. "Cost per ticket" needs Step 5's traffic first).
+
+### Step 8: watch it in SigNoz's own UI
+
+Open `http://localhost:8080`. **Services** tab: all 3 app services listed once they've each handled at least one request. **Alerts** tab: both rules and their firing history. **Traces** tab: search `investigate.tier2` to see Tier 2's own reasoning as a trace, with its `gen_ai.*` attributes.
+
+### Step 9: stop everything
+
+```bash
+docker compose down
+```
+**Why:** stops and removes the 4 containers. **Outcome:** the named Postgres volume (`app-postgres-data`) is preserved, so settings and incident history survive the next `docker compose up`. Add `-v` only if you want a fully clean slate (this deletes that volume).
+
+### Troubleshooting: containers exit right after starting
+
+If every container exits with code `255` immediately after `docker compose up`, and manually restarting your SigNoz containers gives an error like `mount ... not a directory`, this is a known Docker Desktop/WSL2 issue: after the WSL2 VM restarts (sleep/wake, resource-saver idling out, a host reboot), its bind-mount table can get out of sync with the host filesystem. Fix: fully restart Docker Desktop (or on Windows, `wsl --shutdown` then relaunch Docker Desktop), start your SigNoz containers again, then re-run `docker compose up -d --build` for this repo. Nothing in this repo's own code causes this, it's one layer down, in Docker itself.
+
+---
+
+## 3. What's done, what's left
 
 | Capability | Status | Where |
 |---|---|---|
-| A working "production" service that answers requests and can be told to fail on demand | Done, verified live | `worker-service` |
-| A shared place to store behavior switches and change them live, with no restart | Done, verified live | `control-plane` |
-| A permanent audit log of every automated action taken | Done, verified live, every test alert wrote a real row | `control-plane` |
+| A working "production" service that answers requests and can be told to fail on demand | Done | `worker-service` |
+| A shared place to store behavior switches and change them live, with no restart | Done | `control-plane` |
+| A permanent audit log of every automated action taken | Done, every test alert wrote a real row | `control-plane` |
 | 2 real SigNoz alert rules, firing automatically on real telemetry | Done, both confirmed firing without any manual trigger of the webhook itself | SigNoz UI |
 | Tier 1: deterministic diagnosis + safety check + fix + report for the 2 known failures | Done, verified live with real SigNoz-fired alerts | `watcher-service/src/services/{diagnose,safetyCheck,remediation.service}.js` |
-| Tier 2: an LLM agent that investigates *unrecognized* alerts using real SigNoz telemetry as tools | **Built and verified up to the LLM call itself.** The SigNoz query tools, the tool-calling loop, the guardrails, the OTel spans, all tested with real data. Provider-agnostic via the Vercel AI SDK, defaults to Gemini, works the same with Anthropic or OpenAI. Needs a real API key for whichever provider is active, see [Section 6](#6-the-ai--agent-layer-in-full). | `watcher-service/src/services/investigate.js`, `src/clients/{llmClient,signozClient}.js` |
-| A UI for demoing, instead of raw curl/terminal | **Not done** | see [Section 9](#9-the-ui-reactnextjs) |
-| SigNoz dashboards for cost, LLM usage, agent activity | **Not done**, panels documented and ready to build | see [Section 10](#10-signoz-dashboards-alerts-exceptions-llm-cost) |
+| Tier 2: an LLM agent that investigates unrecognized alerts using real SigNoz telemetry as tools | Done, verified end to end with a real live model call (Gemini). Provider-agnostic, works the same with Anthropic or OpenAI. | `watcher-service/src/services/investigate.js`, `src/clients/{llmClient,signozClient}.js` |
+| SigNoz dashboards for cost, LLM usage, agent activity | Done, 6 panels, importable from [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), confirmed pulling real data | see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost) |
+| A UI for demoing, instead of raw curl/PowerShell | Not built | see [Section 8](#8-the-ui-reactnextjs-not-built-yet) |
 
-**What you can already show, right now, with zero manual curls after the initial failure trigger:** break the DB or spike the cost, SigNoz notices on its own, calls the agent on its own, the agent fixes it and logs why, on its own. That's Tier 1, proven twice with real alerts. For a failure nobody anticipated, Tier 2 will investigate it with a real LLM the moment a provider API key (Gemini by default) is set, everything downstream of that is already built and tested against real SigNoz data.
+**Readiness checklist:**
+- [x] control-plane built, tested, layered (routes -> controllers -> services -> repositories), documented
+- [x] worker-service built, tested, reads live settings from control-plane on every ticket
+- [x] watcher-service Tier 1 built, tested, both known failures verified live with real SigNoz-fired alerts
+- [x] All 4 containers build and run together via `docker compose up`
+- [x] worker-service tags traces with the business labels `CONTRACTS.md` Section 3 defines (`ticket.id`, `db.broken`, `model.name`, `estimated_cost_usd`)
+- [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
+- [x] Both real SigNoz alert rules created and confirmed firing automatically end to end
+- [x] `diagnose.js`, `safetyCheck.js`, `remediation.service.js` fully wired
+- [x] Tier 2 built: real SigNoz Query API client, LLM tool-calling loop, guardrails, OpenTelemetry spans
+- [x] A provider API key set (Gemini) and a live Tier 2 investigation run end to end with a real model response
+- [x] SigNoz dashboard built and importable (6 panels, all confirmed pulling real data)
+- [ ] React/Next.js UI built with the panels in [Section 8](#8-the-ui-reactnextjs-not-built-yet)
+- [ ] Optional: tag each incident with which tier handled it, for an accurate "N instant fixes vs M AI investigations" dashboard panel (the current dashboard approximates this via total alert count instead, see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost))
 
 ---
 
-## 3. Functional requirements, per service
+## 4. Functional requirements, per service
 
-Plain-English requirements, written so a non-technical reviewer can check them off one by one. STATUS reflects the real code today, not the plan.
+Plain-English requirements, written so a non-technical reviewer can check them off one by one. STATUS reflects the real code today, not a plan.
 
 ### control-plane (the shared settings + audit log)
 
@@ -85,12 +271,12 @@ Plain-English requirements, written so a non-technical reviewer can check them o
 | FR-WS-04 | Apply an approved fix by updating the matching setting on control-plane. | Done, verified live for both known failures. |
 | FR-WS-05 | Record every alert it handles as an incident on control-plane, whether the fix was applied, blocked, or no action was taken. | Done, verified for Tier 1 and Tier 2 alike. |
 | FR-WS-06 | Expose a liveness endpoint independent of alert traffic. | Done |
-| FR-WS-07 | For alerts Tier 1 doesn't recognize, investigate using real SigNoz telemetry (traces, error spans) as tools for an LLM, instead of giving up. Provider-agnostic: works with Gemini, Anthropic, or OpenAI without code changes. | **Done**, the tools and the tool-calling loop are real and tested against live SigNoz data (see [Section 6](#6-the-ai--agent-layer-in-full)). Needs a real API key for whichever `LLM_PROVIDER` is active to make the actual model call. |
+| FR-WS-07 | For alerts Tier 1 doesn't recognize, investigate using real SigNoz telemetry (traces, error spans) as tools for an LLM, instead of giving up. Provider-agnostic: works with Gemini, Anthropic, or OpenAI without code changes. | Done, verified end to end with a real live model call, see [Section 7](#7-the-ai--agent-layer-in-full). |
 | FR-WS-08 | Tier 2's proposed action must be restricted to the same 3 known setting keys as Tier 1, anything else discarded; the whole investigation must have a hard timeout; every LLM/tool call must be traced. | Done: `VALID_KEYS` allowlist, 10s timeout via `Promise.race`, manual OTel spans with `gen_ai.*` attributes on the LLM call and `signoz.*` attributes on each tool call. |
 
 ---
 
-## 4. Current architecture
+## 5. Current architecture + file map
 
 ```
    +------------------------------------+
@@ -132,8 +318,6 @@ Plain-English requirements, written so a non-technical reviewer can check them o
         worker-service reads settings from here too
 ```
 
-### Current file map (accurate as of this document)
-
 ```
 control-plane/
   src/
@@ -163,22 +347,25 @@ watcher-service/
       remediation.service.js   # the loop: diagnose -> safety -> apply -> report
       diagnose.js               # Tier 1 if/else; falls through to Tier 2 when unmatched
       safetyCheck.js            # the one hardcoded safety rule
-      investigate.js            # NEW: Tier 2 orchestrator, LLM tool-calling loop
+      investigate.js            # Tier 2 orchestrator, LLM tool-calling loop
     clients/
       controlPlaneClient.js     # PUT /settings, POST /incidents, GET /settings
-      llmClient.js               # NEW: picks the LLM provider (Gemini/Anthropic/OpenAI) via the Vercel AI SDK
-      signozClient.js            # NEW: real SigNoz Query API v4 client (read-only)
+      llmClient.js               # picks the LLM provider (Gemini/Anthropic/OpenAI) via the Vercel AI SDK
+      signozClient.js            # real SigNoz Query API v4 client (read-only)
+
+signoz/
+  dashboard-ai-sre-observability.json   # importable dashboard definition, see Section 9
 ```
 
-No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-reactnextjs)).
+No React/Next.js app exists yet anywhere in the repo (see [Section 8](#8-the-ui-reactnextjs-not-built-yet)).
 
 ---
 
-## 5. Ticket vocabulary + master endpoint reference
+## 6. Ticket vocabulary + master endpoint reference
 
 **What is a "ticket"?** A simulated customer-support request. It is not stored anywhere permanently, worker-service keeps ticket IDs as an in-memory counter that resets to 0 every time the service restarts. There is no ticket database, only the fake customer-lookup layer described below.
 
-**How is a ticket generated?** By sending `POST /tickets` to worker-service with an optional JSON body `{ "customerId": "<any string>" }`. If `customerId` is omitted, worker-service falls back to using the ticket's own numeric ID as the customer ID for the real-lookup path, or the literal string `"unknown"` for the backup-data path. There is no other input, no ticket "type," no priority field, nothing else the caller can set.
+**How is a ticket generated?** By sending `POST /tickets` to worker-service with an optional JSON body `{ "customerId": "<any string>" }`. If `customerId` is omitted, worker-service falls back to using the ticket's own numeric ID as the customer ID for the real-lookup path, or the literal string `"unknown"` for the backup-data path.
 
 **Every possible outcome of `POST /tickets`:**
 
@@ -204,21 +391,21 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 | worker-service | `POST` | `/debug/fix-db` | Turn off Failure A | humans testing |
 | worker-service | `POST` | `/debug/spike-cost` | Turn on Failure B | humans testing, future UI "Spike Cost" button |
 | worker-service | `POST` | `/debug/fix-cost` | Turn off Failure B | humans testing |
-| watcher-service | `POST` | `/alerts/webhook` | Receive a SigNoz alert | **SigNoz itself**, confirmed firing automatically for both alert rules |
+| watcher-service | `POST` | `/alerts/webhook` | Receive a SigNoz alert | SigNoz itself, confirmed firing automatically for both alert rules |
 | watcher-service | `GET` | `/watcher/status` | Liveness probe | humans testing, docker-compose, future UI |
 | SigNoz | `POST` | `/api/v4/query_range` | Tier 2's read-only telemetry queries | watcher-service's `signozClient.js` |
 
 ---
 
-## 6. The AI / agent layer, in full
+## 7. The AI / agent layer, in full
 
 ### Two tiers, and why both exist
 
-**Tier 1 (deterministic, unchanged from before):** the 2 known failures resolve instantly via plain `if/else` on the alert's rule name. No LLM involved, no unpredictability. This is the reliability backbone, proven live twice with real SigNoz-fired alerts.
+**Tier 1 (deterministic):** the 2 known failures resolve instantly via a plain `if/else` on the alert's rule name. No LLM involved, no unpredictability. See Walkthrough B in [Section 1](#1-how-it-works-the-full-request-flow).
 
-**Tier 2 (new, the actual "AI-native" part):** when an alert's name matches neither known pattern, `diagnose.js` hands off to `investigate.js`, which runs a real LLM tool-calling loop (Gemini by default, swappable to Anthropic or OpenAI) using SigNoz's own Query API as the model's "eyes." This is the functionally necessary use of AI in this system, not decoration, it's the only thing that handles a failure nobody anticipated at all.
+**Tier 2 (LLM-driven):** when an alert's name matches neither known pattern, `diagnose.js` hands off to `investigate.js`, which runs a real LLM tool-calling loop (Gemini by default, swappable to Anthropic or OpenAI) using SigNoz's own Query API as the model's "eyes." See Walkthrough C in [Section 1](#1-how-it-works-the-full-request-flow) for the exact step-by-step.
 
-### Guardrails (why this is safe to demo)
+### Guardrails
 
 | Guardrail | How it's enforced |
 |---|---|
@@ -226,12 +413,12 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 | Read-only investigation | `signozClient.js` only ever calls `query_range`. There is no function in this codebase that can write to SigNoz. |
 | Bounded tools | The LLM is given exactly 2 tools: `query_recent_traces`, `query_error_spans`. No shell, no file access, no arbitrary HTTP. |
 | Hard timeout | The whole investigation races against a 10s timer (`INVESTIGATION_TIMEOUT_MS`). On timeout it resolves to a safe "no action, needs human" result instead of hanging. |
-| Missing API key = safe no-op | If the API key for the active `LLM_PROVIDER` isn't set, `investigate.js` skips straight to the fallback result. Verified for all 3 providers via the code path: an unrecognized alert with `LLM_PROVIDER=gemini` and no `GOOGLE_API_KEY` left settings untouched and logged `"no automated fix, gemini API key not configured"`. |
+| Missing API key = safe no-op | If the API key for the active `LLM_PROVIDER` isn't set, `investigate.js` skips straight to the fallback result, logging which provider's key was missing. |
 | No privileged path for AI-proposed actions | Tier 2's output goes through the exact same `safetyCheck.js` as Tier 1, in the exact same `remediation.service.js` code path. No special case. |
 | Unconditional audit trail | `reportIncident()` fires whether the outcome was applied, blocked, or "insufficient evidence." Nothing is silently dropped, for either tier. |
-| Everything is traced | Every LLM call and every SigNoz tool call gets its own OpenTelemetry span, so the agent's *own investigation* is visible as a trace in SigNoz, not just the infra it's investigating. |
+| Everything is traced | Every LLM call and every SigNoz tool call gets its own OpenTelemetry span, so the agent's own investigation is visible as a trace in SigNoz, not just the infra it's investigating. |
 
-**Will the agent modify code? No.** Its entire vocabulary of possible actions, in either tier, is 3 named config switches on control-plane. It cannot write files, run shell commands, deploy, or touch source code. That's not a limitation we're apologizing for, it's the design: safety through a small, enumerable action space, not through hoping a model behaves.
+**Will the agent modify code? No.** Its entire vocabulary of possible actions, in either tier, is 3 named config switches on control-plane. It cannot write files, run shell commands, deploy, or touch source code. Safety comes from a small, enumerable action space, not from hoping a model behaves.
 
 ### Provider-agnostic by design
 
@@ -239,133 +426,44 @@ No React/Next.js app exists yet anywhere in the repo (see [Section 9](#9-the-ui-
 
 | `LLM_PROVIDER` | Package used | Default model | Key env var |
 |---|---|---|---|
-| `gemini` (default) | `@ai-sdk/google` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
+| `gemini` (default) | `@ai-sdk/google` | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
 | `anthropic` | `@ai-sdk/anthropic` | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
 | `openai` | `@ai-sdk/openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 
-Override the model for any provider with `LLM_MODEL`. Everything else, the tool-calling loop, guardrails, span attributes, is identical regardless of which row is active, that's the point of building on the AI SDK's unified interface instead of a provider-specific SDK.
+Override the model for any provider with `LLM_MODEL`. Note: `gemini-2.0-flash` returned a quota-exceeded error (`limit: 0`) on a real free-tier Google account during testing, even with a fresh API key, this is why `gemini-2.5-flash` is the default instead. If you hit the same error, try a different `LLM_MODEL` override or check your key's plan at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
 
-### Tier 2's exact flow, verified against real infrastructure
-
-```
-1. SigNoz fires an alert whose name matches neither known pattern
-2. POST watcher-service:4002/alerts/webhook
-3. diagnose.js's Tier 1 fails to match -> calls investigate(alertPayload)
-4. investigate.js calls the AI SDK's generateText() against whichever model
-   llmClient.getModel() returns (Gemini by default), with a bounded step
-   budget (maxSteps: 4) and 2 tools:
-     system prompt: "investigate using your tools, respond with ONLY
-                      {diagnosis, action|null}, action must be one of the
-                      3 known keys"
-   a. Model requests tool query_recent_traces({serviceName, minutes})
-      -> signozClient.queryRecentTraces() -> real POST to SigNoz's
-         /api/v4/query_range, SIGNOZ-API-KEY header, real span rows back
-   b. Model may request query_error_spans(...) for more evidence
-   c. Model returns final text: diagnosis + action (or null) as JSON
-5. Action validated against VALID_KEYS (discarded if not one of the 3 keys)
-6. Same safetyCheck.js as Tier 1 evaluates it
-7. If allowed and an action exists: PUT control-plane/settings
-8. POST control-plane/incidents, always
-9. Each tool call gets its own OTel span; the overall investigation span
-   carries gen_ai.request.model, gen_ai.usage.input_tokens/output_tokens,
-   and investigate.provider, all nested under "investigate.tier2"
-```
-
-**Verified today, without a real LLM key yet:**
-- `signozClient.queryRecentTraces('worker-service', 15)` called directly inside the running container returned 10 real span rows.
-- The `investigate.tier2` span it produces is a real, queryable trace, confirmed by querying SigNoz for `watcher-service`'s own spans and finding it in the list.
-- Sending an unrecognized alert with `LLM_PROVIDER=gemini` and no `GOOGLE_API_KEY` configured correctly left control-plane's settings untouched and logged `"no automated fix, gemini API key not configured"`, confirming the provider-aware fallback message works.
-
-**What's left to see the LLM actually reason:** set the API key matching `LLM_PROVIDER` (Gemini by default, see below for where to get one) plus `SIGNOZ_API_KEY`, and fire an unrecognized alert. Nothing else needs to change, `investigate.js` never imports a provider SDK directly, it only calls `llmClient.getModel()`.
+**Verified live:** a synthetic unrecognized alert was fired at `watcher-service` with a real Gemini key configured. The model called its `query_error_spans` tool, found no matching error traces, and returned a diagnosis stating exactly that, with `action: null`, correctly declining to guess without evidence. The resulting `investigate.tier2` span, with real `gen_ai.request.model` and token-usage attributes, was confirmed queryable in SigNoz.
 
 ### Two gotchas found the hard way (worth knowing before you touch this)
 
-1. **SigNoz's internal hostname is `signoz-signoz-0`, not `signoz`.** Found by inspecting `signoz-network` directly, the old default in `.env.example`/`docker-compose.yml` was wrong and would have silently returned zero query results forever, no error, just empty data.
+1. **SigNoz's internal hostname may not be what you expect.** In this project's own SigNoz install it turned out to be `signoz-signoz-0`, not `signoz`. Found by inspecting the Docker network directly. Getting it wrong doesn't error, it just silently returns zero query results forever.
 2. **Trace query timestamps are nanoseconds since epoch, not milliseconds.** Every other timestamp in this codebase is milliseconds. Getting this wrong doesn't error either, `query_range` returns `200 success` with an empty `list`, which looks exactly like "no data in this time range" instead of "your request is malformed."
 
 ### Getting a SigNoz API key (for `SIGNOZ_API_KEY`)
 
 1. SigNoz UI -> Settings -> **Service Accounts** -> **New Service Account**, name it e.g. `watcher-service`.
-2. Open it -> **Keys** tab -> **Add Key**, name it, no expiration is fine for a hackathon. Copy the key immediately, it's shown once.
-3. Back on the **Overview** tab -> **Roles** -> select `signoz-viewer` (read-only is all this client needs) -> **you must click "Save Changes"**, selecting the role alone does not persist it, a real gotcha hit while building this.
-4. Put the key in a root `.env` file (gitignored) as `SIGNOZ_API_KEY=...`. `docker-compose.yml` reads it from there.
+2. Open it -> **Keys** tab -> **Add Key**, name it. Copy the key immediately, it's shown once.
+3. Back on the **Overview** tab -> **Roles** -> select `signoz-viewer` (read-only is all this client needs) -> **you must click "Save Changes"**, selecting the role alone does not persist it.
+4. Put the key in the root `.env` file (gitignored) as `SIGNOZ_API_KEY=...`. `docker-compose.yml` reads it from there.
 
 ---
 
-## 7. Why this is a good problem to solve
+## 8. The UI (React/Next.js), not built yet
 
-**The track is "AI & Agent Observability": trace, monitor, debug AI-native systems.** The example builds listed include "Self-healing infra with SigNoz metrics" and "SRE Sidekick built on SigNoz." This project is both at once, not one:
-
-- **Self-healing infra**: Tier 1, proven with 2 real SigNoz-fired alerts, zero AI risk, instant deterministic recovery.
-- **SRE Sidekick / agent-native observability**: Tier 2, an LLM that investigates using SigNoz's own telemetry as tools, exactly what a human SRE does, and its own reasoning process is itself a traced, observable SigNoz trace, not a black box.
-
-**Why this beats "add tracing to a backend":** anyone can emit HTTP spans. What's actually hard, and actually matches the track's brief, is making an *agent's own cognition* observable, its tool calls, its token usage, its reasoning latency, sitting in SigNoz right next to the infrastructure it's diagnosing. That's the differentiator: open a trace during the demo and you're not just looking at a request, you're watching the agent think.
-
-**Real-world framing for the pitch:** "Imagine `worker-service` is a real production API and `control-plane` is a real feature-flag service you already have. `watcher-service` is the on-call engineer. For the 2 failure classes we've seen before, it doesn't even wake up a human, it just fixes it. For something nobody's seen before, it doesn't wake up a human either, it investigates first, using the exact same dashboards a human would open, and only then decides, with a hard boundary it can never cross and a paper trail for everything it does or doesn't do."
-
-**Judging criteria fit:**
-| Criterion | How this project answers it |
-|---|---|
-| Potential Impact | Automates both the boring 3am pages and the actually-hard investigative triage, not just one |
-| Creativity & Innovation | The agent's own reasoning is observable, not just the app it watches |
-| Technical Excellence | Guardrails enforced in code (allowlist, timeout, read-only tools), not promises; small dependency footprint, no framework bloat |
-| Best Use of SigNoz | Alerts, traces, a real Query API integration, and LLM spans all feeding one system |
-| User Experience | (once Section 9's UI exists) one page, no terminal, live |
-| Presentation Quality | This README, `CONTRACTS.md`, and per-service READMEs document the whole system precisely |
-
----
-
-## 8. Target architecture (what's left)
-
-```
-   +--------------------------------------------------+
-   |         React/Next.js dashboard (browser)          |
-   |  live settings + incident feed + agent reasoning    |
-   |  panel + demo controls                              |
-   +----------------------+------------------------------+
-                           | polls GET /settings, GET /incidents
-                           | calls POST /tickets, /debug/*  (demo buttons)
-                           v
-   +------------------------------------+       +--------------------------+
-   |           worker-service            |------>|          SigNoz          |
-   |  tags traces with CONTRACTS.md      |traces |  2 real alert rules      |
-   |  Section 3 labels (done)            |       |  + dashboards for cost,  |
-   +--------------------------------------+       |  LLM tokens/cost, agent |
-                       ^                          |  investigation activity |
-                       | GET /settings              +------------+-------------+
-                       |                                          |
-   +------------------------------------+       +--------------------------+
-   |            control-plane            |<------|      watcher-service      |
-   |   3 settings + incident log (Postgres)|PUT/POST| Tier 1 (done) +         |
-   +------------------------------------+       |  Tier 2 (done, needs a    |
-                                                 |  real provider API key)   |
-                                                 +--------------------------+
-```
-
-**New pieces vs. Section 4's current architecture:** just the React/Next.js dashboard (Section 9) and the SigNoz dashboards (Section 10). Everything backend, including Tier 2's full pipeline, is already built and tested against real infrastructure, it's waiting on a real API key for whichever `LLM_PROVIDER` is active (Gemini by default) to actually invoke the model, not on more code.
-
----
-
-## 9. The UI (React/Next.js)
-
-The system works without a UI, all 3 services are pure APIs. The UI exists purely to make the demo watchable instead of a terminal full of JSON.
+The system works without a UI, all 3 services are pure APIs, everything in [Section 2](#2-quickstart-run-it-end-to-end) is demoable with curl or PowerShell alone. A UI exists purely to make it watchable instead of a terminal full of JSON.
 
 ### What it needs to have
 
 | Panel | Data source | Purpose |
 |---|---|---|
-| **Live settings panel** | Poll `GET control-plane:4001/settings` every 2s | Shows the 3 switches changing in real time when the agent acts, this is the "proof" panel |
-| **Incident timeline** | Poll `GET control-plane:4001/incidents` every 2s | Each incident as a card: detected via, diagnosis, action taken, safety result, timestamp, and which tier handled it |
-| **Agent reasoning panel (the Tier 2 differentiator)** | New: watcher-service could expose a small `GET /investigations/:id` or the incident's diagnosis text already carries it | For AI-investigated incidents, show the actual tool calls made and the reasoning trail, turns "the agent thought about it" into something visible |
-| **"Open in SigNoz" deep link per incident** | Static link built from the incident's timestamp | Jumps to that trace's spans in SigNoz's own UI, tool calls, LLM span with tokens/cost, right there |
-| **Live ticket feed / traffic indicator** | Last few `POST /tickets` responses | Gives the demo a pulse before the failure hits |
-| **Demo control buttons** | `POST worker-service:4000/debug/break-db`, `/debug/spike-cost`, `/fix-*`, plus a "trigger unknown failure" button | Replaces typing curl commands live on stage with one click |
-| **Status strip** | `GET worker-service:4000`, `GET watcher-service:4002/watcher/status` | Shows all services are up before you start |
-| **Link-out to SigNoz** | `localhost:8080` | SigNoz's own UI is the source of truth for traces/alerts/dashboards, don't rebuild it |
-
-### Why React/Next.js specifically
-
-Next.js gives a single small app that can both serve the dashboard and (optionally) proxy calls to the 3 backend services, avoiding CORS setup during a rushed build. A plain Vite React app works too, the requirement is "one page, a few live-polling panels, a few buttons," not a framework choice.
+| Live settings panel | Poll `GET control-plane:4001/settings` every 2s | Shows the 3 switches changing in real time when the agent acts |
+| Incident timeline | Poll `GET control-plane:4001/incidents` every 2s | Each incident as a card: detected via, diagnosis, action taken, safety result, timestamp, which tier handled it |
+| Agent reasoning panel | New: watcher-service could expose a small `GET /investigations/:id`, or reuse the incident's existing diagnosis text | For AI-investigated incidents, show the actual tool calls made and the reasoning trail |
+| "Open in SigNoz" deep link per incident | Static link built from the incident's timestamp | Jumps straight to that trace's spans in SigNoz's own UI |
+| Live ticket feed / traffic indicator | Last few `POST /tickets` responses | Gives a sense of live traffic before a failure hits |
+| Demo control buttons | `POST worker-service:4000/debug/break-db`, `/debug/spike-cost`, `/fix-*`, plus a "trigger unrecognized alert" button | Replaces typing curl/PowerShell commands live with one click |
+| Status strip | `GET worker-service:4000`, `GET watcher-service:4002/watcher/status` | Shows all services are up before starting |
+| Link-out to SigNoz | `localhost:8080` | SigNoz's own UI is the source of truth for traces/alerts/dashboards, no need to rebuild it |
 
 ### Functional requirements for the UI
 
@@ -375,173 +473,46 @@ Next.js gives a single small app that can both serve the dashboard and (optional
 | FR-UI-02 | Display the incident list as a human-readable timeline, most recent first, refreshing automatically, tagged by which tier handled it. |
 | FR-UI-03 | Provide one-click buttons for both failure triggers and both failure fixes, plus one for triggering an unrecognized alert to force Tier 2 to run live. |
 | FR-UI-04 | Visually distinguish an "allowed" action from a "blocked" one in the incident timeline. |
-| FR-UI-05 | Never require the presenter to open a terminal during the live demo. |
+| FR-UI-05 | Never require the presenter to open a terminal during a live walkthrough. |
 
-Not built yet. Nothing in the repo currently serves a browser page.
+Next.js would let one small app both serve the dashboard and proxy calls to the 3 backend services, avoiding CORS setup. A plain Vite React app works too, the actual requirement is "one page, a few live-polling panels, a few buttons," not a specific framework.
 
 ---
 
-## 10. SigNoz: dashboards, alerts, exceptions, LLM cost
+## 9. SigNoz: dashboards, alerts, exceptions, LLM cost
 
-This section is the guide for making full use of SigNoz, not just as a data pipe, but as the system's actual observability surface, which is the whole point of the track.
-
-### 10.1 Alerts (already built, reference)
+### 9.1 Alerts (already built, reference)
 
 | Alert | Type | Query | Threshold | Channel |
 |---|---|---|---|---|
 | `db-error-rate-alert` | Metric-based | `signoz_calls_total`, filter `service.name='worker-service' AND status.code='STATUS_CODE_ERROR'`, Rate/Sum | `> 0`, 5min rolling | `watcher-service` webhook |
 | `cost-spike-alert` | Trace-based | `avg(estimated_cost_usd)`, filter `service.name='worker-service'` | `> 0.5`, 5min rolling | `watcher-service` webhook |
 
-Both point at `http://watcher-service:4002/alerts/webhook`. To add a 3rd (e.g. for a future failure mode), repeat the same pattern, reuse the existing webhook channel, and give `diagnose.js` a matching branch or let Tier 2 handle it as unrecognized.
+Both point at `http://watcher-service:4002/alerts/webhook`. To add a 3rd alert (e.g. for a future failure mode), repeat the same pattern, reuse the existing webhook channel, and give `diagnose.js` a matching branch, or let Tier 2 handle it as unrecognized.
 
-### 10.2 Exceptions
+### 9.2 Exceptions
 
-SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordException()` API. This codebase calls it explicitly in `investigate.js`'s catch block, so any failure inside Tier 2 (a malformed LLM response, a network error calling the LLM provider, a bug) will show up there, not just in `docker compose logs`. To verify once a provider API key is set: check SigNoz's Exceptions tab after a Tier 2 run, especially useful for debugging a misbehaving investigation without needing container log access.
+SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordException()` API. This codebase calls it explicitly in `investigate.js`'s catch block, so any failure inside Tier 2 (a malformed LLM response, a network error calling the LLM provider, a bug) shows up there too, not just in `docker compose logs`. Useful for debugging a misbehaving investigation without needing container log access.
 
-### 10.3 Dashboards to build (none exist yet, this is the plan)
+### 9.3 Dashboard (built, importable)
 
-Create via SigNoz UI -> Dashboards -> New Dashboard -> Add Panel. Suggested panels, each with the exact query to use:
+[`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json) is a real dashboard definition exported from a working SigNoz instance. Import steps are in [Section 2, Step 7](#2-quickstart-run-it-end-to-end). It has 6 panels, all traces-based, all confirmed pulling real data:
 
-| Panel | Data source | Query | Why it matters for the demo |
-|---|---|---|---|
-| Worker error rate | Metrics | `signoz_calls_total`, filter `status.code='STATUS_CODE_ERROR'`, group by `service.name` | Shows Failure A visually spiking and recovering |
-| Cost per ticket over time | Traces | `avg(estimated_cost_usd)`, filter `service.name='worker-service'` | Shows Failure B's cost spike and the fix bringing it back down, live, on screen |
-| LLM token usage | Traces | `sum(gen_ai.usage.input_tokens)` and `sum(gen_ai.usage.output_tokens)`, filter `service.name='watcher-service'` | Proves the agent is making real LLM calls, not faking it, exactly the "AI-native observability" ask |
-| LLM investigation latency | Traces | `avg(durationNano)` on spans named `llm.investigate_turn` | Shows Tier 2's real-world response time |
-| Agent tool-call volume | Traces | `count()` on spans named `signoz.query_recent_traces` / `signoz.query_error_spans` | Shows how many times the agent looked at telemetry before deciding |
-| Incidents by tier (requires the optional tier tag from Section 11, step 9) | Traces or a custom metric exported from `remediation.service.js` | count grouped by tier | The "N resolved instantly, M required AI investigation" story for judges |
+| Panel | Query | What it shows |
+|---|---|---|
+| Worker error rate (Failure A) | `count()`, filter `service.name = 'worker-service' AND has_error = 'true'` | Failure A spiking and recovering |
+| Cost per ticket over time (Failure B) | `avg(estimated_cost_usd)`, filter `service.name = 'worker-service'` | Failure B's cost spike and the fix bringing it back down |
+| LLM token usage | `sum(gen_ai.usage.input_tokens)` and `sum(gen_ai.usage.output_tokens)`, filter `name = 'investigate.tier2'` | Real LLM calls happening, not faked |
+| LLM investigation latency | `avg(duration_nano)`, filter `name = 'investigate.tier2'` | Tier 2's real-world response time |
+| Agent tool-call volume | `count()` split across `name = 'signoz.query_recent_traces'` / `'signoz.query_error_spans'` | How many times the agent looked at telemetry before deciding |
+| Tier 2 investigations vs total alerts received | `count()` on `name = 'investigate.tier2'` vs `name = 'POST'`, both `service.name = 'watcher-service'` | Approximates "N resolved instantly by Tier 1, M needed AI investigation"; an exact split needs the optional tier tag noted in [Section 3](#3-whats-done-whats-left) |
 
-All of these are span **attributes already being set** by the code in this repo (`gen_ai.*` in `investigate.js`, `estimated_cost_usd` in `worker-service`, span names throughout), building the dashboard is pure SigNoz UI work, no new instrumentation needed.
+All of these read span **attributes already being set** by the code in this repo, no new instrumentation was needed to build this dashboard, only its definition.
 
-### 10.4 LLM cost, concretely
+### 9.4 LLM cost, concretely
 
-Whichever provider's per-token pricing (Gemini's, Anthropic's, or OpenAI's, published on each provider's site) multiplied by `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` (already captured on the investigation span) gives real dollar cost per investigation. A dashboard panel summing tokens over a time range, multiplied by the active model's rate, turns into a literal "here's what our AI agent cost us today" number, worth having on screen next to `estimated_cost_usd` (the fake business cost worker-service reports), the contrast between the two costs is a good demo beat.
-
----
-
-## 11. Exact steps to close the gap
-
-1. ~~Capture a real SigNoz alert payload~~ **Done.**
-2. ~~Create both real SigNoz alert rules~~ **Done.**
-3. ~~Wire `diagnose.js`, `safetyCheck.js`, `remediation.service.js`~~ **Done.**
-4. ~~Build Tier 2: SigNoz query tools, LLM tool-calling loop, guardrails, tracing~~ **Done**, verified against real SigNoz data.
-5. **Set `GOOGLE_API_KEY` (or switch `LLM_PROVIDER` and set the matching key) and `SIGNOZ_API_KEY`** in a root `.env` file (see Section 6's "getting a SigNoz API key"), then fire an alert with a name that matches neither known pattern and watch Tier 2 actually reason.
-6. **Build the UI** (Section 9).
-7. **Build the SigNoz dashboards** (Section 10.3), all the underlying data already exists.
-8. **Rehearse the full loop live**: break DB, watch it self-heal (Tier 1); fire an unrecognized alert, watch the LLM investigate and decide (Tier 2); show the dashboards updating; show the trace of the agent's own reasoning in SigNoz.
-9. Optional polish: tag incidents with which tier handled them (add a column or prefix the `detected_via` string), export it as its own metric for the "N vs M" dashboard panel in Section 10.3.
+Whichever provider's per-token pricing (published on each provider's site) multiplied by `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` (already captured on the `investigate.tier2` span) gives a real dollar cost per investigation. Summing tokens over a time range and multiplying by the active model's rate turns into an actual "here's what this agent cost today" number, worth comparing against `estimated_cost_usd` (the fake business cost `worker-service` reports for its own simulated tickets).
 
 ---
-
-## 12. Status matrix + readiness checklist
-
-| Service | Built | Talks to control-plane | Runs in docker-compose | Real SigNoz-driven behavior |
-|---|:---:|:---:|:---:|:---:|
-| control-plane | Yes | n/a (it *is* the store) | Yes | Yes, all 3 services' traces reach SigNoz |
-| worker-service | Yes | Yes | Yes | Tickets + debug switches work; custom trace labels done (FR-WK-08) |
-| watcher-service (Tier 1) | Yes | Yes | Yes | Both known failures verified end to end with real SigNoz-fired alerts |
-| watcher-service (Tier 2) | Yes | Yes | Yes | Provider-agnostic (Gemini/Anthropic/OpenAI); SigNoz query tools + tool-calling loop verified with real data; needs a real key for the active provider for the model call itself |
-| UI | No | | | See Section 9 |
-| SigNoz dashboards | No | | | See Section 10.3 |
-
-**Readiness checklist:**
-- [x] control-plane built, tested, layered, documented
-- [x] worker-service built, tested, reads live settings from control-plane
-- [x] watcher-service Tier 1 built, tested, both known failures verified live with real SigNoz alerts
-- [x] All 4 containers build and run together via `docker compose up`
-- [x] worker-service tags traces with `CONTRACTS.md` Section 3 labels (FR-WK-08)
-- [x] `CONTRACTS.md` Section 2 filled with a real captured SigNoz alert payload
-- [x] Both real SigNoz alert rules created and confirmed firing automatically end to end
-- [x] `diagnose.js`, `safetyCheck.js`, `remediation.service.js` fully wired
-- [x] Tier 2 built: real SigNoz Query API client, LLM tool-calling loop, guardrails, OTel spans, all verified against live infrastructure
-- [ ] A provider API key set (Gemini by default) and a live Tier 2 investigation run end to end with a real model response
-- [ ] SigNoz dashboards built (Section 10.3)
-- [ ] React/Next.js UI built with the panels in Section 9
-- [x] Full Tier 1 loop demoed with zero manual curls after the initial failure trigger, for both failures, with real SigNoz-fired alerts
-
----
-
-## 13. Run it yourself: Windows, Linux, macOS
-
-Requires Docker Desktop running and SigNoz already up (`foundryctl cast`, see `casting.yaml`) since `docker-compose.yml` joins SigNoz's existing network. `docker compose` itself is identical on all 3 platforms, only the traffic-generation loop and env var syntax differ below.
-
-### 1. Configure secrets (optional, only needed for Tier 2)
-
-Create a `.env` file in the repo root (gitignored, never commit it):
-```
-SIGNOZ_API_KEY=<from SigNoz Settings -> Service Accounts, see Section 6>
-LLM_PROVIDER=gemini
-GOOGLE_API_KEY=<from https://aistudio.google.com/apikey>
-```
-Switching providers is just changing `LLM_PROVIDER` to `anthropic` or `openai` and setting the matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` instead. Without any of these, everything still works, Tier 2 just safely no-ops on unrecognized alerts instead of investigating.
-
-### 2. Start everything (same command, all platforms)
-
-```bash
-docker compose up -d --build
-docker compose ps
-```
-All 4 should show `Up`/`healthy`: `app-postgres`, `control-plane`, `watcher-service`, `worker-service`.
-
-| Service | Port |
-|---|---|
-| control-plane | `4001` |
-| watcher-service | `4002` |
-| worker-service | `4000` |
-| app-postgres | `5433` (host, avoids a local Postgres install on 5432) |
-| SigNoz UI | `8080` |
-
-### 3. Test the happy path and both failures (identical `curl` commands on macOS/Linux and Windows 10+, curl.exe ships built in)
-
-```bash
-curl -s http://localhost:4001/settings
-curl -s -X POST http://localhost:4000/tickets -H "Content-Type: application/json" -d '{"customerId":"c1"}'
-
-# Failure A: break the DB, watch SigNoz fire the alert automatically within ~1-2 min
-curl -s -X POST http://localhost:4000/debug/break-db
-```
-
-**Generate continuous traffic** (needed so SigNoz's alert has sustained data to evaluate against, a one-off ticket isn't enough):
-
-- **macOS / Linux (bash):**
-  ```bash
-  while true; do curl -s -o /dev/null -X POST http://localhost:4000/tickets -H "Content-Type: application/json" -d '{"customerId":"c1"}'; sleep 1; done
-  ```
-- **Windows (PowerShell):**
-  ```powershell
-  while ($true) { Invoke-RestMethod -Method Post -Uri http://localhost:4000/tickets -ContentType "application/json" -Body '{"customerId":"c1"}' | Out-Null; Start-Sleep -Seconds 1 }
-  ```
-- **Windows (Git Bash, if installed):** identical to the macOS/Linux command above.
-
-Stop the loop (Ctrl+C), then:
-```bash
-curl -s http://localhost:4001/settings   # use_backup_data should now be true
-curl -s http://localhost:4001/incidents  # a new row explaining what happened
-curl -s -X POST http://localhost:4000/debug/fix-db
-curl -s -X PUT http://localhost:4001/settings -H "Content-Type: application/json" -d '{"key":"use_backup_data","value":false,"updated_by":"reset"}'
-```
-
-Repeat with `/debug/spike-cost` / `/debug/fix-cost` and watch `active_model` flip instead, for Failure B.
-
-### 4. Test Tier 2 (unrecognized alert)
-
-```bash
-curl -s -X POST http://localhost:4002/alerts/webhook -H "Content-Type: application/json" -d '{
-  "alerts":[{"labels":{"alertname":"something-nobody-anticipated"}}],
-  "commonLabels":{"alertname":"something-nobody-anticipated"}
-}'
-docker compose logs watcher-service --tail 10
-```
-Without a key for the active provider: settings unchanged, incident logged as `"no automated fix, gemini API key not configured"` (or `anthropic`/`openai`, matching whichever `LLM_PROVIDER` is set). With it: the LLM actually investigates using SigNoz's telemetry and may propose a fix.
-
-### 5. Watch it in SigNoz
-
-Open `http://localhost:8080` -> Services tab, all 3 app services should be listed once they've handled a request. Alerts tab shows both rules and their firing history. Traces tab, search for `investigate.tier2` to see Tier 2's own reasoning as a trace.
-
-### 6. Stop everything
-
-```bash
-docker compose down   # stop everything, keeps the Postgres volume
-```
 
 Per-service deep dives: [`control-plane/README.md`](control-plane/README.md), [`worker-service/README.md`](worker-service/README.md).
