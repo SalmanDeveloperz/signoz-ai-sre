@@ -1,0 +1,33 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix-broken-merge-watcher-diagnose-remediation",
+    "main",
+    "origin",
+    "salman-telemetry-fix",
+    "salman-worker-service",
+    "signoz-stack-wiring",
+    "watcher-day2-remediation-loop",
+    "watcher-service-impl"
+  ],
+  "parent": {
+    "fix-broken-merge-watcher-diagnose-remediation": "main",
+    "main": null,
+    "origin": "main",
+    "salman-telemetry-fix": "main",
+    "salman-worker-service": "main",
+    "signoz-stack-wiring": "main",
+    "watcher-day2-remediation-loop": "main",
+    "watcher-service-impl": "main"
+  },
+  "order": [
+    "main",
+    "fix-broken-merge-watcher-diagnose-remediation",
+    "origin",
+    "salman-telemetry-fix",
+    "salman-worker-service",
+    "signoz-stack-wiring",
+    "watcher-day2-remediation-loop",
+    "watcher-service-impl"
+  ]
+}
