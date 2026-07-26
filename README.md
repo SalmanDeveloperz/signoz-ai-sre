@@ -13,7 +13,7 @@ Full data contracts: [`CONTRACTS.md`](CONTRACTS.md). Agent/AI coding rules: [`AG
 5. [Current architecture + file map](#5-current-architecture--file-map)
 6. [Ticket vocabulary + master endpoint reference](#6-ticket-vocabulary--master-endpoint-reference)
 7. [The AI / agent layer, in full](#7-the-ai--agent-layer-in-full)
-8. [The UI (React/Next.js), not built yet](#8-the-ui-reactnextjs-not-built-yet)
+8. [The UI (React/Next.js)](#8-the-ui-reactnextjs)
 9. [SigNoz: dashboards, alerts, exceptions, LLM cost](#9-signoz-dashboards-alerts-exceptions-llm-cost)
 
 ---
@@ -109,7 +109,18 @@ docker compose ps
 | app-postgres | `5433` (host side; kept off `5432` to avoid clashing with a local Postgres install) |
 | SigNoz UI | `8080` (from your existing SigNoz install) |
 
-### Step 3: verify the happy path
+### Step 3: start the frontend (recommended, a clickable alternative to Steps 4-6 below)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+**Why:** the frontend is a separate Vite project (not part of `docker-compose.yml`, it doesn't need a container to develop against), so it's installed and started on its own. **Outcome:** Vite prints a local URL, normally `http://localhost:5173`. Open it: you'll see a live-updating settings panel, an incident timeline with search, a ticket feed, and one-click buttons for every scenario in Steps 4 to 6. It talks to the 3 backend services through Vite's dev proxy (configured in `frontend/vite.config.ts`), so no CORS setup was needed on any Express service. Click **Guide** in the top right for the same walkthrough in-app. See [Section 8](#8-the-ui-reactnextjs) for what's in it.
+
+The rest of this Quickstart uses curl/PowerShell directly against the APIs, useful for scripting or verifying a specific call, everything in Steps 4 to 6 maps 1:1 to a button in the frontend if you'd rather click than type.
+
+### Step 4: verify the happy path
 
 - **macOS / Linux / Windows (Git Bash):**
   ```bash
@@ -123,7 +134,7 @@ docker compose ps
   ```
 **Why:** the first call proves control-plane is up and serving its 3 default settings. The second proves worker-service can reach control-plane and handle a ticket (Walkthrough A above). **Outcome:** the first returns `{"use_backup_data":false,"active_model":"gpt-standard","retry_enabled":true}`; the second returns a `ticket_id`, a fake `customer`, the active `model`, and a small `estimated_cost_usd`.
 
-### Step 4: trigger Failure A (`db-error-rate`) and watch it self-heal
+### Step 5: trigger Failure A (`db-error-rate`) and watch it self-heal
 
 ```bash
 curl -s -X POST http://localhost:4000/debug/break-db
@@ -151,11 +162,11 @@ curl -s -X POST http://localhost:4000/debug/fix-db
 curl -s -X PUT http://localhost:4001/settings -H "Content-Type: application/json" -d '{"key":"use_backup_data","value":false,"updated_by":"reset"}'
 ```
 
-### Step 5: trigger Failure B (`cost-spike`) the same way
+### Step 6: trigger Failure B (`cost-spike`) the same way
 
-Repeat Step 4 with `/debug/spike-cost` and `/debug/fix-cost` instead. **Outcome:** `active_model` flips to `gpt-cheap` instead of `use_backup_data` flipping, everything else about the flow is identical.
+Repeat Step 5 with `/debug/spike-cost` and `/debug/fix-cost` instead. **Outcome:** `active_model` flips to `gpt-cheap` instead of `use_backup_data` flipping, everything else about the flow is identical.
 
-### Step 6: trigger Tier 2 (an alert nobody wrote a rule for)
+### Step 7: trigger Tier 2 (an alert nobody wrote a rule for)
 
 There's no real SigNoz alert rule for an "unrecognized" failure by definition, so this is demoed by posting directly to the same webhook SigNoz would call, with a name Tier 1 doesn't recognize:
 
@@ -174,7 +185,7 @@ docker compose logs watcher-service --tail 20
 ```
 Without a provider key configured: `"no automated fix, gemini API key not configured"` (or whichever provider), settings untouched, an incident still logged. With one configured: a real model-generated diagnosis, e.g. *"the worker-service is experiencing high latency, but there are no recent error spans or traces to indicate the cause"*, meaning the model actually called its SigNoz tools, found no evidence, and correctly proposed no action rather than guessing.
 
-### Step 7: set up the SigNoz dashboard
+### Step 8: set up the SigNoz dashboard
 
 A ready-to-import dashboard definition is committed at [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), 6 panels wired to the exact span attributes this codebase already emits (no new instrumentation needed, see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost) for what each panel shows).
 
@@ -184,13 +195,13 @@ A ready-to-import dashboard definition is committed at [`signoz/dashboard-ai-sre
    - **Windows (PowerShell):** `Get-Content signoz\dashboard-ai-sre-observability.json -Raw | Set-Clipboard`
 2. Open SigNoz at `http://localhost:8080/dashboard` -> **New dashboard** -> **Import JSON**.
 3. Paste into the editor, click **Import and Next**, then confirm on the next screen.
-**Outcome:** a dashboard named "AI SRE: Self-Healing Infra Observability" appears with all 6 panels already querying real data, no manual panel-building required. Panels will show "No Data" for anything you haven't triggered yet (e.g. "Cost per ticket" needs Step 5's traffic first).
+**Outcome:** a dashboard named "AI SRE: Self-Healing Infra Observability" appears with all 6 panels already querying real data, no manual panel-building required. Panels will show "No Data" for anything you haven't triggered yet (e.g. "Cost per ticket" needs Step 6's traffic first).
 
-### Step 8: watch it in SigNoz's own UI
+### Step 9: watch it in SigNoz's own UI
 
 Open `http://localhost:8080`. **Services** tab: all 3 app services listed once they've each handled at least one request. **Alerts** tab: both rules and their firing history. **Traces** tab: search `investigate.tier2` to see Tier 2's own reasoning as a trace, with its `gen_ai.*` attributes.
 
-### Step 9: stop everything
+### Step 10: stop everything
 
 ```bash
 docker compose down
@@ -214,7 +225,7 @@ If every container exits with code `255` immediately after `docker compose up`, 
 | Tier 1: deterministic diagnosis + safety check + fix + report for the 2 known failures | Done, verified live with real SigNoz-fired alerts | `watcher-service/src/services/{diagnose,safetyCheck,remediation.service}.js` |
 | Tier 2: an LLM agent that investigates unrecognized alerts using real SigNoz telemetry as tools | Done, verified end to end with a real live model call (Gemini). Provider-agnostic, works the same with Anthropic or OpenAI. | `watcher-service/src/services/investigate.js`, `src/clients/{llmClient,signozClient}.js` |
 | SigNoz dashboards for cost, LLM usage, agent activity | Done, 6 panels, importable from [`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json), confirmed pulling real data | see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost) |
-| A UI for demoing, instead of raw curl/PowerShell | Not built | see [Section 8](#8-the-ui-reactnextjs-not-built-yet) |
+| A UI for demoing, instead of raw curl/PowerShell | Done, built with Vite + React + shadcn/ui, verified against the live backend | `frontend/`, see [Section 8](#8-the-ui-reactnextjs) |
 
 **Readiness checklist:**
 - [x] control-plane built, tested, layered (routes -> controllers -> services -> repositories), documented
@@ -228,8 +239,8 @@ If every container exits with code `255` immediately after `docker compose up`, 
 - [x] Tier 2 built: real SigNoz Query API client, LLM tool-calling loop, guardrails, OpenTelemetry spans
 - [x] A provider API key set (Gemini) and a live Tier 2 investigation run end to end with a real model response
 - [x] SigNoz dashboard built and importable (6 panels, all confirmed pulling real data)
-- [ ] React/Next.js UI built with the panels in [Section 8](#8-the-ui-reactnextjs-not-built-yet)
-- [ ] Optional: tag each incident with which tier handled it, for an accurate "N instant fixes vs M AI investigations" dashboard panel (the current dashboard approximates this via total alert count instead, see [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost))
+- [x] React/Next.js UI built with the panels in [Section 8](#8-the-ui-reactnextjs), verified against the live backend
+- [ ] Optional: tag each incident with which tier handled it on the backend, so the UI and dashboard no longer need to infer it from diagnosis text (see `inferTier()` in Section 8, and the "N instant fixes vs M AI investigations" dashboard panel in [Section 9](#9-signoz-dashboards-alerts-exceptions-llm-cost))
 
 ---
 
@@ -355,9 +366,25 @@ watcher-service/
 
 signoz/
   dashboard-ai-sre-observability.json   # importable dashboard definition, see Section 9
+
+frontend/
+  src/
+    components/ui/       # shadcn primitives
+    components/shared/    # SectionCard, InfoTooltip, SearchBar, StatusBadge, PageHeader, GuideDialog
+    features/
+      settings/           # SettingsPanel, useSettings
+      incidents/           # IncidentTimeline, IncidentCard, useIncidents
+      demo-controls/       # DemoControls, useDemoControls
+      tickets/             # TicketFeed
+      status/              # StatusStrip, useServiceStatus
+    lib/
+      api.ts                # typed client for all 3 backend services
+      types.ts               # Settings, Incident, TicketResponse, inferTier()
+      ticketFeedStore.ts
+  vite.config.ts            # dev-server proxy to the 3 backend services, no CORS needed
 ```
 
-No React/Next.js app exists yet anywhere in the repo (see [Section 8](#8-the-ui-reactnextjs-not-built-yet)).
+Standalone Vite project, see [Section 8](#8-the-ui-reactnextjs) for the full breakdown and how to run it.
 
 ---
 
@@ -448,34 +475,64 @@ Override the model for any provider with `LLM_MODEL`. Note: `gemini-2.0-flash` r
 
 ---
 
-## 8. The UI (React/Next.js), not built yet
+## 8. The UI (React/Next.js)
 
-The system works without a UI, all 3 services are pure APIs, everything in [Section 2](#2-quickstart-run-it-end-to-end) is demoable with curl or PowerShell alone. A UI exists purely to make it watchable instead of a terminal full of JSON.
+The system works without a UI, all 3 services are pure APIs, everything in [Section 2](#2-quickstart-run-it-end-to-end) is demoable with curl or PowerShell alone. The UI exists to make it watchable instead of a terminal full of JSON. It lives in [`frontend/`](frontend), a standalone Vite project, and is started with `cd frontend && npm install && npm run dev` (Step 3 of the Quickstart).
 
-### What it needs to have
+### Stack
 
-| Panel | Data source | Purpose |
+Vite + React + TypeScript, [shadcn/ui](https://ui.shadcn.com) (built on Radix UI primitives) for accessible components, Tailwind CSS v4 for styling, [TanStack Query](https://tanstack.com/query) for live-polling data fetching, [Sonner](https://sonner.emilkowal.ski) for toast feedback, `lucide-react` for icons. One permanent dark blue theme (no light/dark toggle, this is an operations console, not a marketing site).
+
+Every call to the 3 backend services goes through Vite's own dev-server proxy (`frontend/vite.config.ts`), so the browser only ever talks to `localhost:5173`, same-origin. None of the 3 Express services needed any CORS changes.
+
+### Structure (feature-based)
+
+```
+frontend/src/
+  components/
+    ui/           # shadcn primitives (button, card, tooltip, checkbox, radio-group, ...)
+    shared/        # this app's own reusable pieces built on top of ui/:
+                     SectionCard (the one card shell every panel uses),
+                     InfoTooltip (the "(i)" affordance next to any non-obvious control),
+                     SearchBar, StatusBadge, PageHeader, GuideDialog
+  features/
+    settings/       # SettingsPanel + useSettings (poll + mutate control-plane)
+    incidents/      # IncidentTimeline + IncidentCard + useIncidents (poll + client-side search/filter)
+    demo-controls/  # DemoControls + useDemoControls (one hook per backend action)
+    tickets/        # TicketFeed (reads a small client-only pub-sub store, worker-service keeps no ticket history of its own)
+    status/         # StatusStrip + useServiceStatus (health-check polling)
+  lib/
+    api.ts          # typed fetch wrappers for control-plane / worker-service / watcher-service
+    types.ts         # Settings, Incident, TicketResponse, and inferTier() (see note below)
+    ticketFeedStore.ts
+```
+
+Every panel is a `SectionCard`: an icon, a title, an optional "(i)" tooltip explaining what the panel is for, and its content. That's what makes the whole page read as one system instead of 6 differently-built widgets.
+
+### What's in it
+
+| Panel | Talks to | What it shows |
 |---|---|---|
-| Live settings panel | Poll `GET control-plane:4001/settings` every 2s | Shows the 3 switches changing in real time when the agent acts |
-| Incident timeline | Poll `GET control-plane:4001/incidents` every 2s | Each incident as a card: detected via, diagnosis, action taken, safety result, timestamp, which tier handled it |
-| Agent reasoning panel | New: watcher-service could expose a small `GET /investigations/:id`, or reuse the incident's existing diagnosis text | For AI-investigated incidents, show the actual tool calls made and the reasoning trail |
-| "Open in SigNoz" deep link per incident | Static link built from the incident's timestamp | Jumps straight to that trace's spans in SigNoz's own UI |
-| Live ticket feed / traffic indicator | Last few `POST /tickets` responses | Gives a sense of live traffic before a failure hits |
-| Demo control buttons | `POST worker-service:4000/debug/break-db`, `/debug/spike-cost`, `/fix-*`, plus a "trigger unrecognized alert" button | Replaces typing curl/PowerShell commands live with one click |
-| Status strip | `GET worker-service:4000`, `GET watcher-service:4002/watcher/status` | Shows all services are up before starting |
-| Link-out to SigNoz | `localhost:8080` | SigNoz's own UI is the source of truth for traces/alerts/dashboards, no need to rebuild it |
+| Control-plane settings | `GET`/`PUT control-plane:4001/settings`, polled every 2s | The 3 shared switches as a checkbox (`use_backup_data`), a checkbox (`retry_enabled`), and a radio group (`active_model`). Editable directly too, exactly like a human operator using `PUT /settings` would. |
+| Incident timeline | `GET control-plane:4001/incidents`, polled every 2s | Every incident, most recent first, with a Tier 1/Tier 2 badge, an allowed/blocked badge, a search box that filters client-side across diagnosis/action/source, and an "Open in SigNoz" link per row. |
+| Demo controls | `POST worker-service:4000/debug/*`, `POST worker-service:4000/tickets`, `POST watcher-service:4002/alerts/webhook` | One button per scenario: Break DB, Fix DB, Spike cost, Fix cost, send one ticket, an auto-send toggle (sends a ticket once a second, so a real SigNoz alert can fire on its own without a terminal loop), and Trigger unrecognized alert (forces Tier 2). |
+| Live ticket feed | Local only | Every ticket sent from this browser tab, since worker-service itself keeps no ticket history (see Section 6). |
+| Status strip | `GET control-plane:4001/settings`, any response from worker-service, `GET watcher-service:4002/watcher/status` | A green/red dot per service, polled every 5s, so a presenter can confirm everything is healthy before starting. |
+| Guide dialog | Static content | An in-app version of this README's "How it works" and "Try it yourself" walkthroughs, so nobody has to leave the browser to understand what they're looking at. |
+
+**Note on tier badges:** the backend doesn't tag which tier handled an incident yet (see [Section 3](#3-whats-done-whats-left)'s optional polish item), so `lib/types.ts`'s `inferTier()` infers it client-side from the diagnosis text, Tier 1's two known failures always produce one of two exact strings, anything else is Tier 2. This is a display-only inference and doesn't affect any backend behavior.
 
 ### Functional requirements for the UI
 
-| ID | Requirement |
-|---|---|
-| FR-UI-01 | Display all 3 current settings, refreshing automatically without a page reload. |
-| FR-UI-02 | Display the incident list as a human-readable timeline, most recent first, refreshing automatically, tagged by which tier handled it. |
-| FR-UI-03 | Provide one-click buttons for both failure triggers and both failure fixes, plus one for triggering an unrecognized alert to force Tier 2 to run live. |
-| FR-UI-04 | Visually distinguish an "allowed" action from a "blocked" one in the incident timeline. |
-| FR-UI-05 | Never require the presenter to open a terminal during a live walkthrough. |
+| ID | Requirement | Status |
+|---|---|---|
+| FR-UI-01 | Display all 3 current settings, refreshing automatically without a page reload. | Done |
+| FR-UI-02 | Display the incident list as a human-readable timeline, most recent first, refreshing automatically, tagged by which tier handled it. | Done |
+| FR-UI-03 | Provide one-click buttons for both failure triggers and both failure fixes, plus one for triggering an unrecognized alert to force Tier 2 to run live. | Done |
+| FR-UI-04 | Visually distinguish an "allowed" action from a "blocked" one in the incident timeline. | Done |
+| FR-UI-05 | Never require the presenter to open a terminal during a live walkthrough. | Done |
 
-Next.js would let one small app both serve the dashboard and proxy calls to the 3 backend services, avoiding CORS setup. A plain Vite React app works too, the actual requirement is "one page, a few live-polling panels, a few buttons," not a specific framework.
+Verified live: every panel confirmed against the real running backend, including watching the Settings panel flip `use_backup_data` to `true` on its own within 2 seconds of an external alert firing, with no interaction on the page, proving the polling and not just the buttons actually works.
 
 ---
 
@@ -496,7 +553,7 @@ SigNoz's Exceptions tab tracks errors recorded via OpenTelemetry's `span.recordE
 
 ### 9.3 Dashboard (built, importable)
 
-[`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json) is a real dashboard definition exported from a working SigNoz instance. Import steps are in [Section 2, Step 7](#2-quickstart-run-it-end-to-end). It has 6 panels, all traces-based, all confirmed pulling real data:
+[`signoz/dashboard-ai-sre-observability.json`](signoz/dashboard-ai-sre-observability.json) is a real dashboard definition exported from a working SigNoz instance. Import steps are in [Section 2, Step 8](#2-quickstart-run-it-end-to-end). It has 6 panels, all traces-based, all confirmed pulling real data:
 
 | Panel | Query | What it shows |
 |---|---|---|
