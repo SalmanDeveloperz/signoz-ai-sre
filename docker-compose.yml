@@ -80,6 +80,20 @@ services:
     depends_on: [control-plane]
     networks: [signoz-network]
 
+  frontend:
+    build: ./frontend
+    environment:
+      # Overrides vite.config.ts's localhost defaults: inside this container,
+      # "localhost" would mean the container itself, not its sibling
+      # services, so the dev-server proxy needs their real service names.
+      CONTROL_PLANE_URL: http://control-plane:4001
+      WORKER_URL: http://worker-service:4000
+      WATCHER_URL: http://watcher-service:4002
+    ports:
+      - "5173:5173"
+    depends_on: [control-plane, worker-service, watcher-service]
+    networks: [signoz-network]
+
 # The network SigNoz already created via foundryctl cast. `external: true` means
 # compose joins it rather than trying to create/own it.
 networks:
