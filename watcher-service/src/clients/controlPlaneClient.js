@@ -1,4 +1,4 @@
-// Pattern: Client (the "repository" analog — isolates all HTTP calls to one
+// Pattern: Client (the "repository" analog: isolates all HTTP calls to one
 // external service behind named functions). This is the watcher's ONLY way to
 // change worker-service's behavior: through the shared control-plane, never by
 // calling worker-service directly. Shapes are fixed by CONTRACTS.md Sections 1 & 5.
